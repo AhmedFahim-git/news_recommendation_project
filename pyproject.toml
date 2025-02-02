@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "news_rec_utils"
+version = "2025.0.0"
+dependencies = [
+    "torch",
+    "tqdm",
+    "transformers",
+    "sentence-transformers",
+    "peft",
+    "accelerate",
+]
+requires-python = ">=3.9"
+authors = [{ name = "Ahmed Fahim", email = "afahim03@yahoo.com" }]
+maintainers = [{ name = "Ahmed Fahim", email = "afahim03@yahoo.com" }]
+description = "Some helper functions for my thesis project"
+readme = "README.md"
+license = { file = "LICENSE" }
+
+
+[project.scripts]
+evaluate = "news_rec_utils.evaluate:main"
+store_process_data = "news_rec_utils.prepare_data:main"

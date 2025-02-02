@@ -1,0 +1,234 @@
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+)
+import torch
+import torch.nn.functional as F
+from typing import Optional
+from .config import DEVICE, EMBEDDING_DIM, TORCH_DTYPE, HEAD_MAX_BATCH_SIZE, LORA_CONFIG
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPooling,
+    BaseModelOutputWithPast,
+)
+from tqdm import tqdm
+from contextlib import nullcontext
+from collections.abc import Callable
+from peft.mapping import get_peft_model
+
+# path = "Alibaba-NLP/gte-base-en-v1.5"
+
+
+def dummy_text_inputs_outputs(batch_size: int, max_len: int, device=DEVICE):
+    return {
+        "inputs": {
+            "input_ids": torch.ones((batch_size, max_len), dtype=torch.int).to(device),
+            "attention_mask": torch.ones((batch_size, max_len), dtype=torch.int).to(
+                device
+            ),
+            "token_type_ids": torch.zeros((batch_size, max_len), dtype=torch.int).to(
+                device
+            ),
+        },
+        "outputs": torch.ones((batch_size,), dtype=torch.float32, device=device),
+    }
+
+
+def dummy_head_inputs_outputs(
+    batch_size: int, max_len: int, embedding_dim: int = EMBEDDING_DIM, device=DEVICE
+):
+    return {
+        "inputs": {
+            "embeddings": torch.rand((batch_size, max_len, embedding_dim)).to(device),
+            "attention_mask": torch.ones((batch_size, max_len), dtype=torch.int32).to(
+                device
+            ),
+        },
+        "outputs": torch.ones(
+            (batch_size * max_len,), dtype=torch.float32, device=device
+        ),
+    }
+
+
+@torch.compile
+def last_token_pool(
+    last_hidden_states: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+    if left_padding:
+        return last_hidden_states[:, -1]
+    else:
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[
+            torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths
+        ]
+
+
+def output_pool(model) -> Callable[[torch.Tensor, ...], torch.Tensor]:
+    def get_last_embedding(
+        last_hidden_states: torch.Tensor, *args, **kwargs
+    ) -> torch.Tensor:
+        return last_hidden_states[:, 0]
+
+    if model.config.architectures[0] == "Qwen2ForCausalLM":
+        return last_token_pool
+    elif model.config.architectures[0] == "NewModel":
+        return get_last_embedding
+    # Alternate implementation
+    # with torch.no_grad():
+    #     output = model(**dummy_text_inputs(1, 1, device=model.device)).to("cpu")
+    # if isinstance(output, BaseModelOutputWithPast):
+    #     return last_token_pool
+    # elif isinstance(output, BaseModelOutputWithPooling):
+    #     return get_last_embedding
+
+
+# As a final task please add an attention layer on top of the news embeddings to get modified embeddings that takes all news into account
+def get_model_and_tokenizer(path: str, peft_model: bool = False, device=DEVICE):
+    model = AutoModel.from_pretrained(
+        path,
+        trust_remote_code=True,
+        unpad_inputs=True,
+        use_memory_efficient_attention=True,
+        # torch_dtype=torch.float16,
+    ).to(device)
+    if peft_model and not hasattr(model, "peft_config"):
+        model = get_peft_model(model, LORA_CONFIG)
+
+    if hasattr(model, "peft_config"):
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+    tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
+    return model, tokenizer
+
+
+# Add attention layer over embeddings
+def get_sequence_classification_model(path, device=DEVICE):
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        path,
+        trust_remote_code=True,
+        unpad_inputs=True,
+        use_memory_efficient_attention=True,
+        # torch_dtype=torch.float16,
+        num_labels=1,
+    ).to(device)
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in list(model.parameters())[-4:]:
+        param.requires_grad = True
+
+    return model, tokenizer
+
+
+# To do. Try replacing with dataloader
+def get_text_embed_eval(model, tokenizer, text_col, batch_size, max_len):
+    device = model.device
+    pool_fn = output_pool(model)
+    text_embed_list = []
+    cast_context = (
+        torch.autocast(device_type="cuda", dtype=TORCH_DTYPE)
+        if model.device.type == "cuda"
+        else nullcontext()
+    )
+    with torch.no_grad(), cast_context:
+        for i in tqdm(range(0, len(text_col), batch_size)):
+            inputs = tokenizer(
+                text_col.iloc[i : i + batch_size].to_list(),
+                max_length=max_len,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(device)
+            text_embed_list += (
+                pool_fn(model(**inputs).last_hidden_state, inputs["attention_mask"])
+                .detach()
+                .cpu()
+                .tolist()
+            )
+    return text_embed_list
+
+
+def get_head_model(path: str, device=DEVICE):
+    if path.endswith(".json"):
+        my_config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+
+        my_model = AutoModel.from_config(my_config, trust_remote_code=True)
+        return my_model.to(device)
+    else:
+        return AutoModel.from_pretrained(path, trust_remote_code=True).to(device)
+
+
+def pad_and_batch(
+    impressions: torch.Tensor,
+    embeddings: torch.Tensor,
+    max_batch_size: int = HEAD_MAX_BATCH_SIZE,
+    labels: Optional[torch.Tensor] = None,
+):
+    assert len(impressions) == len(embeddings)
+    _, lengths = torch.unique_consecutive(impressions, return_counts=True)
+    cumsum_lengths = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)])
+    assert max(lengths) <= max_batch_size
+    start = 0
+    end = 0
+    while end < len(lengths):
+        end = (cumsum_lengths <= (cumsum_lengths[start] + max_batch_size)).sum() - 1
+        max_len = lengths[start:end].max()
+        attn_mask = torch.stack(
+            [
+                F.pad(
+                    torch.ones(i, dtype=torch.int32),
+                    (0, max_len - i),
+                    mode="constant",
+                    value=0,
+                )
+                for i in lengths[start:end]
+            ]
+        )
+        embeds = torch.stack(
+            [
+                F.pad(
+                    embeddings[cumsum_lengths[i] : cumsum_lengths[i + 1]],
+                    (0, 0, 0, max_len - lengths[i]),
+                    mode="constant",
+                    value=0,
+                )
+                for i in range(start, end)
+            ]
+        )
+        if isinstance(labels, torch.Tensor):
+            labs = labels[cumsum_lengths[start] : cumsum_lengths[end]]
+            yield embeds, attn_mask, labs
+        else:
+            yield embeds, attn_mask
+        start = end
+
+
+def unpad(embeds, attn_mask):
+    sequence_lengths = attn_mask.sum(dim=1)
+    return torch.cat([embeds[i, :l] for i, l in enumerate(sequence_lengths)])
+
+
+def use_head_model_eval(
+    model: torch.nn.Module,
+    impressions: torch.Tensor,
+    embeddings: torch.Tensor,
+    max_batch_size: int = HEAD_MAX_BATCH_SIZE,
+) -> torch.Tensor:
+    device = model.device
+    pred_scores = []
+    for i, j in pad_and_batch(impressions, embeddings, max_batch_size):
+        with torch.no_grad():
+            res = model(
+                i.to(device), j.to(device=device, dtype=torch.float32)
+            ).last_hidden_state
+        pred_scores.append(unpad(res.cpu(), j))
+
+    return torch.cat(pred_scores)
