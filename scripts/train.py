@@ -207,7 +207,7 @@ class TextModelTrainer:
         history_max_len=HISTORY_TEXT_MAXLEN,
         news_text_max_len=NEWS_TEXT_MAXLEN,
         device=DEVICE,
-        ckpt_steps=50,
+        ckpt_steps=200,
         warmup_steps=10,
     ):
         self.device = device
@@ -237,7 +237,7 @@ class TextModelTrainer:
             train_dataset,
             batch_size=batch_size,
             pin_memory=True,
-            num_workers=4,
+            num_workers=2,
             sampler=sampler,
             collate_fn=partial_collate,
         )
