@@ -207,7 +207,7 @@ class TextModelTrainer:
         history_max_len=HISTORY_TEXT_MAXLEN,
         news_text_max_len=NEWS_TEXT_MAXLEN,
         device=DEVICE,
-        ckpt_steps=200,
+        ckpt_steps=1000,
         warmup_steps=10,
     ):
         self.device = device
