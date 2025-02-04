@@ -208,7 +208,7 @@ class TextModelTrainer:
         news_text_max_len=NEWS_TEXT_MAXLEN,
         device=DEVICE,
         ckpt_steps=1000,
-        warmup_steps=10,
+        warmup_steps=100,
     ):
         self.device = device
         self.ckpt_steps = ckpt_steps
@@ -333,13 +333,15 @@ class TextModelTrainer:
                 running_loss += self.train_one_batch(inputs)
                 if do_batch_profiling:
                     prof.step()
-                if (i + 1) % self.ckpt_steps == 0:
+                if (i + 1) % 200 == 0:
                     last_loss = running_loss / self.ckpt_steps  # loss per batch
                     # print("Epoch {}  batch {} loss: {}".format(epoch, i + 1, last_loss))
                     logger.info(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
                     print(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
                     # logger.info(torch.cuda.memory_summary())
                     running_loss = 0.0
+
+                if (i + 1) % self.ckpt_steps == 0:
                     if ckpt_dir:
                         os.makedirs(ckpt_dir, exist_ok=True)
                         self.model.save_pretrained(
@@ -397,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup_steps",
         type=int,
-        default=50,
+        default=100,
         help="Select the number of warmup steps",
     )
 
