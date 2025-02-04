@@ -5,14 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "news_rec_utils"
 version = "2025.0.0"
-dependencies = [
-    "torch",
-    "tqdm",
-    "transformers",
-    "sentence-transformers",
-    "peft",
-    "accelerate",
-]
+dependencies = ["tqdm"]
 requires-python = ">=3.9"
 authors = [{ name = "Ahmed Fahim", email = "afahim03@yahoo.com" }]
 maintainers = [{ name = "Ahmed Fahim", email = "afahim03@yahoo.com" }]

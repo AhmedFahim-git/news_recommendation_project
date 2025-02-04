@@ -10,6 +10,7 @@ from news_rec_utils.config import (
     DEVICE,
     HISTORY_TEXT_MAXLEN,
     NEWS_TEXT_MAXLEN,
+    MODEL_PATH,
 )
 from news_rec_utils.batch_size_finder import get_text_train_batch_size
 from news_rec_utils.modelling import get_model_and_tokenizer, output_pool
@@ -21,6 +22,7 @@ import os
 from typing import Optional
 from pathlib import Path
 import numpy as np
+import argparse
 
 torch.manual_seed(1234)
 
@@ -184,7 +186,7 @@ class TrainSampler(Sampler):
             all_chunks.append(zero_chunks[i])
             all_chunks.append(one_chunks[i])
 
-        temp_copy = pd.DataFrame({"final_index": np.concat(all_chunks)})
+        temp_copy = pd.DataFrame({"final_index": np.concatenate(all_chunks)})
 
         batches = np.arange(self.num_batches)
         self.rng.shuffle(batches[:-1])
@@ -335,6 +337,7 @@ class TextModelTrainer:
                     last_loss = running_loss / self.ckpt_steps  # loss per batch
                     # print("Epoch {}  batch {} loss: {}".format(epoch, i + 1, last_loss))
                     logger.info(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
+                    print(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
                     # logger.info(torch.cuda.memory_summary())
                     running_loss = 0.0
                     if ckpt_dir:
@@ -365,8 +368,50 @@ class TextModelTrainer:
 
 
 if __name__ == "__main__":
-    trainer = TextModelTrainer(
-        Path("data"), NewsDataset.MINDsmall_train, "Alibaba-NLP/gte-base-en-v1.5"
+    parser = argparse.ArgumentParser(description="Training setup args")
+    parser.add_argument(
+        "data_dir",
+        type=Path,
+        help="Path to the directory containing data",
     )
-    ckpt_dir = Path("model_ckpt")
-    trainer.train(1, ckpt_dir, False)
+
+    parser.add_argument(
+        "news_dataset",
+        choices=NewsDataset._member_names_,
+        help="Select the news dataset",
+    )
+
+    # Optional arguments
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=MODEL_PATH,
+        help=f"Path to the model file (default: {MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        type=Path,
+        default=None,
+        help="Select the directory for saving model checkpoints",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=50,
+        help="Select the number of warmup steps",
+    )
+
+    args = parser.parse_args()
+
+    # Ensure the data_dir is a valid directory
+    if not args.data_dir.is_dir():
+        parser.error(f"The path '{args.data_dir}' is not a valid directory.")
+
+    # Convert dataset name to Enum
+    news_dataset = NewsDataset[args.news_dataset]
+
+    trainer = TextModelTrainer(
+        args.data_dir, news_dataset, args.model_path, warmup_steps=args.warmup_steps
+    )
+    # ckpt_dir = Path("model_ckpt")
+    trainer.train(1, args.ckpt_dir, False)

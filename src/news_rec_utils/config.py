@@ -17,8 +17,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "Alibaba-NLP/gte-base-en-v1.5"
 HEAD_MODEL_PATH = "models/head_model/best_model"
 
-HISTORY_TEXT_MAXLEN = 256  # Can be over 20,000
-NEWS_TEXT_MAXLEN = 256  # Actually close to 600
+HISTORY_TEXT_MAXLEN = 1024  # Can be over 20,000
+NEWS_TEXT_MAXLEN = 600  # Actually close to 600
 
 HEAD_MAXLEN = 600  # Actual is around 600
 
