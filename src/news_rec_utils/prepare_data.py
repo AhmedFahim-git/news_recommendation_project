@@ -53,12 +53,7 @@ class HistoryDataset(Dataset):
         return len(self.history_list)
 
     def __getitem__(self, idx):
-        return EMBEDDING_SYSTEM_PROMPT + "\n".join(
-            map(
-                lambda x: self.news_text_dict[x],
-                self.history_list[idx].split()[::-1],
-            )
-        )
+        return process_history(self.news_text_dict, self.history_list[idx])
 
 
 class NewsTextDataset(Dataset):
@@ -160,16 +155,18 @@ class TextTrainDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            EMBEDDING_SYSTEM_PROMPT
-            + "\n".join(
-                map(
-                    lambda x: self.news_text_dict[x],
-                    self.history[self.final_array[2, idx]].split()[::-1],
-                )
+            process_history(
+                self.news_text_dict, str(self.history[self.final_array[2, idx]])
             ),
-            self.news_text_dict[self.news_list[self.final_array[0, idx]]],
-            self.news_text_dict[self.news_list[self.final_array[1, idx]]],
+            self.news_text_dict[str(self.news_list[self.final_array[0, idx]])],
+            self.news_text_dict[str(self.news_list[self.final_array[1, idx]])],
         )
+
+
+def process_history(news_text_dict: dict[str, str], history: str):
+    return EMBEDDING_SYSTEM_PROMPT + "\n".join(
+        [f"{i+1}. {news_text_dict[x]}" for i, x in enumerate(history.split()[::-1])]
+    )
 
 
 def load_dataset(
