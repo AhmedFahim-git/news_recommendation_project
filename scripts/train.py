@@ -1,5 +1,6 @@
 from torch.utils.data import DataLoader
 import torch
+import torch.nn.functional as F
 from functools import partial
 from torch import optim
 from tqdm import tqdm
@@ -79,9 +80,9 @@ class TextModelTrainer:
         self.model, self.tokenizer = get_model_and_tokenizer(
             model_path, peft_model=True, device=device
         )
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-3)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-5)
         self.loss_fn = torch.nn.TripletMarginWithDistanceLoss(
-            distance_function=torch.nn.CosineSimilarity()
+            distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y), margin=0.7
         )
         self.pool_fn = output_pool(self.model)
 
