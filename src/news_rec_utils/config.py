@@ -12,6 +12,12 @@ class NewsDataset(Enum):
     MINDlarge_test = "MINDlarge_test"
 
 
+class DataSubset(Enum):
+    WITH_HISTORY = "with_history"
+    WITHOUT_HISTORY = "without_history"
+    ALL = "all"
+
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODEL_PATH = "Alibaba-NLP/gte-base-en-v1.5"
@@ -43,6 +49,8 @@ User's Past News Articles (in reverse chronological order):
 """
 
 TORCH_DTYPE = torch.float32
+
+NUM_WORKERS = 2
 
 if torch.cuda.is_available():
     compute_capability = torch.cuda.get_device_capability(DEVICE)

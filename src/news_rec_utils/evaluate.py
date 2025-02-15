@@ -3,7 +3,6 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 from sklearn.metrics import roc_auc_score
-from scipy.spatial.distance import cosine
 from .config import (
     NewsDataset,
     HISTORY_TEXT_MAXLEN,
@@ -11,6 +10,8 @@ from .config import (
     HEAD_MAX_BATCH_SIZE,
     MODEL_PATH,
     HEAD_MODEL_PATH,
+    NUM_WORKERS,
+    DEVICE,
 )
 from .batch_size_finder import get_text_inference_batch_size
 from .modelling import (
@@ -19,10 +20,21 @@ from .modelling import (
     get_head_model,
     use_head_model_eval,
 )
-from .prepare_data import split_behaviors
+from .prepare_data import (
+    split_impressions,
+    HistoryDataset,
+    NewsTextDataset,
+    eval_collate_fn,
+    load_dataset,
+)
 from pathlib import Path
 from typing import Optional
 import argparse
+from torch.utils.data import DataLoader
+from functools import partial
+from scipy.stats import rankdata
+
+# Scoring functions adapted from https://github.com/msnews/MIND/blob/master/evaluate.py
 
 
 def dcg_score(y_true, y_score, k=10):
@@ -46,15 +58,15 @@ def mrr_score(y_true, y_score):
     return np.sum(rr_score) / np.sum(y_true)
 
 
-def score(input_df: pd.DataFrame):
+def score(preds_input, labels_input):
     aucs = []
     mrrs = []
     ndcg5s = []
     ndcg10s = []
 
-    for ind, row in tqdm(input_df.iterrows(), total=len(input_df)):
-        labels = row["label"]
-        sub_ranks = row["preds"]
+    for ind in tqdm(range(len(preds_input))):
+        labels = labels_input[ind]
+        sub_ranks = preds_input[ind]
 
         lt_len = float(len(labels))
 
@@ -87,168 +99,207 @@ def score(input_df: pd.DataFrame):
     }
 
 
-def load_dataset_and_models(
-    data_dir: Path,
-    news_dataset: NewsDataset,
-    model_path: str,
-    head_model_path: str,
-    num_samples: Optional[int] = None,
+def get_history_news_text_embeds(
+    history_list,
+    news_list,
+    news_text_dict,
+    model_path: Optional[str] = None,
+    model=None,
+    tokenizer=None,
 ):
-    behaviors = pd.read_parquet(
-        data_dir / "processed" / news_dataset.value / "behaviors.parquet"
-    )
-    news_text = pd.read_parquet(
-        data_dir / "processed" / news_dataset.value / "news_text.parquet"
-    )
-    history_text = pd.read_parquet(
-        data_dir / "processed" / news_dataset.value / "history_text.parquet"
-    )
-    model, tokenizer = get_model_and_tokenizer(model_path)
+    assert ((model is not None) and (tokenizer is not None)) or (
+        model_path is not None
+    ), "Either the model and tokenizer or the model path must be provided"
 
-    head_model = get_head_model(head_model_path)
-    if num_samples:
-        behaviors = behaviors.iloc[:num_samples]
-    return behaviors, news_text, history_text, model, tokenizer, head_model
+    if ((model is None) or (tokenizer is None)) and (model_path is not None):
+        model, tokenizer = get_model_and_tokenizer(model_path)
 
-
-def evaluate_part_with_history(behaviors, history_text, news_text):
-    if len(behaviors) == 0:
-        return None
-    behaviors = behaviors.merge(
-        history_text[["History", "history_embedding"]], on="History", how="left"
-    )
-    behaviors_split = split_behaviors(behaviors)
-
-    behaviors_split = behaviors_split.merge(news_text, on="target_impression")
-
-    behaviors_split["pred_scores"] = behaviors_split.apply(
-        lambda x: 1 - cosine(x["history_embedding"], x["news_embedding"]), axis=1
-    )
-
-    behaviors_split["preds"] = behaviors_split.groupby("ImpressionID")[
-        "pred_scores"
-    ].rank(method="min", ascending=False)
-
-    scoring_df = (
-        behaviors_split.groupby("ImpressionID")[["preds", "target_result"]]
-        .agg(list)
-        .rename(columns={"target_result": "label"})
-    )
-
-    print("Eval scores for samples with history")
-    print(score(scoring_df))
-
-    return scoring_df
-
-
-def evaluate_part_without_history(behaviors, news_text, head_model):
-    if len(behaviors) == 0:
-        return None
-    behaviors_split = split_behaviors(behaviors)
-
-    behaviors_split = behaviors_split.merge(news_text, on="target_impression")
-
-    impressions = torch.tensor(
-        behaviors_split["ImpressionID"].values, dtype=torch.int32
-    )
-
-    behaviors_split["pred_scores"] = (
-        use_head_model_eval(
-            head_model,
-            impressions,
-            torch.tensor(behaviors_split["news_embedding"]),
-            HEAD_MAX_BATCH_SIZE,
-        )
-        .squeeze()
-        .numpy()
-    )
-
-    behaviors_split["preds"] = behaviors_split.groupby("ImpressionID")[
-        "pred_scores"
-    ].rank(method="min", ascending=False)
-
-    scoring_df = (
-        behaviors_split.groupby("ImpressionID")[["preds", "target_result"]]
-        .agg(list)
-        .rename(columns={"target_result": "label"})
-    )
-
-    print("Eval scores for samples without history")
-    print(score(scoring_df))
-
-    return scoring_df
-
-
-def evaluate_df(
-    behaviors: pd.DataFrame,
-    news_text: pd.DataFrame,
-    history_text: pd.DataFrame,
-    model,
-    tokenizer,
-    head_model,
-):
-
-    history_text = history_text[
-        history_text["History"].isin(behaviors["History"])
-    ].reset_index(drop=True)
-
-    target_impressions = (
-        behaviors["Impressions"].str.split().explode().str.slice(stop=-2).unique()
-    )
-    news_text = news_text[news_text["NewsID"].isin(target_impressions)].reset_index(
-        drop=True
-    )
-
+    assert isinstance(model, torch.nn.Module)
     model.eval()
-    head_model.eval()
-
     history_batch_size = get_text_inference_batch_size(model, HISTORY_TEXT_MAXLEN)
     news_text_batch_size = get_text_inference_batch_size(model, NEWS_TEXT_MAXLEN)
 
     print(f"History batch size: {history_batch_size}")
     print(f"News text batch size: {news_text_batch_size}")
 
-    history_text["history_embedding"] = get_text_embed_eval(
-        model,
-        tokenizer,
-        history_text["text"],
-        history_batch_size,
-        HISTORY_TEXT_MAXLEN,
+    history_dataset = HistoryDataset(history_list, news_text_dict)
+    history_collate_fn = partial(
+        eval_collate_fn, tokenizer=tokenizer, max_len=HISTORY_TEXT_MAXLEN
     )
-    news_text["news_embedding"] = get_text_embed_eval(
-        model,
-        tokenizer,
-        news_text["news_text"],
-        news_text_batch_size,
-        NEWS_TEXT_MAXLEN,
+    history_dataloader = DataLoader(
+        history_dataset,
+        batch_size=history_batch_size,
+        collate_fn=history_collate_fn,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=NUM_WORKERS,
     )
 
-    news_text = news_text[["NewsID", "news_embedding"]].rename(
-        columns={"NewsID": "target_impression"}
+    news_dataset = NewsTextDataset(news_list, news_text_dict)
+    news_collate_fn = partial(
+        eval_collate_fn, tokenizer=tokenizer, max_len=NEWS_TEXT_MAXLEN
+    )
+    news_dataloader = DataLoader(
+        news_dataset,
+        batch_size=news_text_batch_size,
+        collate_fn=news_collate_fn,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=NUM_WORKERS,
     )
 
-    history_pred_scores = evaluate_part_with_history(
-        behaviors[behaviors["History"].notna()], history_text, news_text
+    history_embeds = get_text_embed_eval(model, history_dataloader)
+    news_embeds = get_text_embed_eval(model, news_dataloader)
+    return history_embeds, news_embeds
+
+
+def evaluate_part_with_history(
+    filtered_news_rev_index, history_embeds, news_embeds, imp_counts, history_rev_index
+):
+    cos_sim = torch.nn.CosineSimilarity()
+    result_list = []
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
+
+    history_embeds = history_embeds[torch.tensor(history_rev_index, dtype=torch.int32)]
+
+    for i in tqdm(range(len(imp_counts)), desc="Finding similarity"):
+        result_list.append(
+            rankdata(
+                -cos_sim(
+                    history_embeds[[i]].to(DEVICE),
+                    news_embeds[
+                        torch.tensor(
+                            filtered_news_rev_index[
+                                cumsum_lengths[i] : cumsum_lengths[i + 1]
+                            ],
+                            dtype=torch.int32,
+                        )
+                    ].to(DEVICE),
+                ).cpu(),
+                method="dense",
+            ).tolist()
+        )
+
+    return np.array(result_list, dtype=object)
+
+
+def evaluate_part_without_history(
+    filtered_news_rev_index,
+    news_embeds,
+    imp_counts,
+    head_model_path: Optional[str] = None,
+    head_model=None,
+):
+    if len(filtered_news_rev_index) == 0:
+        return np.array([], dtype=object)
+    assert (head_model is not None) or (
+        head_model_path is not None
+    ), "Either the head model or the head model path must be provided"
+
+    if head_model_path:
+        head_model = get_head_model(head_model_path)
+
+    assert isinstance(head_model, torch.nn.Module)
+    head_model.eval()
+
+    result_list = []
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
+
+    print("Evaluating using head")
+    pred_scores = (
+        use_head_model_eval(
+            head_model, imp_counts, filtered_news_rev_index, news_embeds
+        )
+        .squeeze()
+        .numpy()
     )
 
-    non_history_pred_scores = evaluate_part_without_history(
-        behaviors[behaviors["History"].isna()], news_text, head_model
+    for i in range(len(imp_counts)):
+        result_list.append(
+            rankdata(
+                -pred_scores[cumsum_lengths[i] : cumsum_lengths[i + 1]], method="dense"
+            ).tolist()
+        )
+
+    return np.array(result_list, dtype=object)
+
+
+def evaluate_df(
+    behaviors: pd.DataFrame,
+    news_text_dict: dict[str, str],
+    output_dir: Optional[Path] = None,
+    model_path: Optional[str] = None,
+    model=None,
+    tokenizer=None,
+    head_model_path: Optional[str] = None,
+    head_model=None,
+):
+    final_score_dict = dict()
+
+    news_list, split_array, imp_counts, labels = split_impressions(
+        behaviors["Impressions"]
     )
 
-    scoring_df = behaviors.merge(
-        pd.concat(
-            [
-                df
-                for df in [history_pred_scores, non_history_pred_scores]
-                if isinstance(df, pd.DataFrame)
-            ]
-        ),
-        on="ImpressionID",
-        how="left",
+    history_list, history_rev_index = np.unique(
+        behaviors[behaviors["History"].notna()]["History"], return_inverse=True
     )
 
-    print("Eval scores for overall")
-    print(score(scoring_df))
+    history_embeds, news_embeds = get_history_news_text_embeds(
+        history_list,
+        news_list,
+        news_text_dict,
+        model_path=model_path,
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+    history_result = evaluate_part_with_history(
+        split_array[0, behaviors["History"].notna().values[split_array[1]]],
+        history_embeds,
+        news_embeds,
+        imp_counts[behaviors["History"].notna()],
+        history_rev_index,
+    )
+
+    without_history_result = evaluate_part_without_history(
+        split_array[0, behaviors["History"].isna().values[split_array[1]]],
+        news_embeds,
+        imp_counts[behaviors["History"].isna()],
+        head_model_path=head_model_path,
+        head_model=head_model,
+    )
+
+    all_preds = np.empty((len(behaviors),), dtype=object)
+
+    all_preds[behaviors["History"].notna().values] = history_result
+    all_preds[behaviors["History"].isna().values] = without_history_result
+
+    if len(labels) > 0:
+        if len(history_result) > 0:
+            "Eval scores for samples with history"
+            final_score_dict["with_history_score"] = score(
+                history_result, labels[behaviors["History"].notna()]
+            )
+            print(final_score_dict["with_history_score"])
+        if len(without_history_result) > 0:
+            "Eval scores for samples without history"
+            final_score_dict["without_history_score"] = score(
+                without_history_result, labels[behaviors["History"].isna()]
+            )
+            print(final_score_dict["without_history_score"])
+        print("Eval scores for overall")
+        final_score_dict["overall_score_dict"] = score(all_preds, labels)
+        print(final_score_dict["overall_score_dict"])
+
+    if output_dir:
+        output_dir.mkdir(exist_ok=True)
+        lines = [
+            f"{imp} [{','.join(map(str, all_preds[i]))}]\n"
+            for i, imp in enumerate(behaviors["ImpressionID"])
+        ]
+        with open(output_dir / "predictions.txt", "w") as f:
+            f.writelines(lines)
+    return final_score_dict
 
 
 def main():
@@ -285,6 +336,13 @@ def main():
     )
 
     parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=Path("."),
+        help=f"Path to the head model file (default: {Path('.')})",
+    )
+
+    parser.add_argument(
         "--num_samples",
         type=int,
         default=None,
@@ -301,12 +359,12 @@ def main():
     dataset_enum = NewsDataset[args.news_dataset]
 
     # Run evaluation
+    behaviors, news_text = load_dataset(args.data_dir, dataset_enum, args.num_samples)
+
     evaluate_df(
-        *load_dataset_and_models(
-            args.data_dir,
-            dataset_enum,
-            args.model_path,
-            args.head_model_path,
-            args.num_samples,
-        )
+        behaviors,
+        news_text,
+        output_dir=args.output_dir,
+        model_path=args.model_path,
+        head_model_path=args.head_model_path,
     )

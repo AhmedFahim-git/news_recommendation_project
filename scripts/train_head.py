@@ -5,8 +5,15 @@ from news_rec_utils.config import (
     NEWS_TEXT_MAXLEN,
     HEAD_MAX_BATCH_SIZE,
     DEVICE,
+    NUM_WORKERS,
+    DataSubset,
 )
-from news_rec_utils.prepare_data import split_behaviors
+from news_rec_utils.prepare_data import (
+    split_impressions,
+    eval_collate_fn,
+    NewsTextDataset,
+    load_dataset,
+)
 from news_rec_utils.modelling import (
     get_head_model,
     get_model_and_tokenizer,
@@ -18,74 +25,73 @@ from news_rec_utils.modelling import (
 from news_rec_utils.evaluate import score
 from news_rec_utils.batch_size_finder import get_text_inference_batch_size
 import torch
+from torch.utils.data import DataLoader
 import numpy as np
 import os
 from torch import optim
 from tqdm import tqdm
 from typing import Optional
+from functools import partial
+from scipy.stats import rankdata
 
 torch.manual_seed(1234)
 
 
 def get_news_embeddings(
-    data_dir: Path, news_dataset: NewsDataset, text_model, tokenizer, news_text_max_len
+    news_list,
+    news_text_dict,
+    news_text_max_len: int,
+    model,
+    tokenizer,
 ):
-    behaviors = pd.read_parquet(
-        data_dir / "processed" / news_dataset.value / "behaviors.parquet"
+
+    model.eval()
+    news_text_batch_size = get_text_inference_batch_size(model, news_text_max_len)
+
+    print(f"News text batch size: {news_text_batch_size}")
+
+    news_dataset = NewsTextDataset(news_list, news_text_dict)
+    news_collate_fn = partial(
+        eval_collate_fn, tokenizer=tokenizer, max_len=NEWS_TEXT_MAXLEN
     )
-    news_text = pd.read_parquet(
-        data_dir / "processed" / news_dataset.value / "news_text.parquet"
+    news_dataloader = DataLoader(
+        news_dataset,
+        batch_size=news_text_batch_size,
+        collate_fn=news_collate_fn,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=NUM_WORKERS,
     )
-
-    behaviors = behaviors[behaviors["History"].isna()].reset_index(drop=True)
-    news_text = news_text.rename(columns={"NewsID": "target_impression"})
-
-    behaviors_split = split_behaviors(behaviors[["ImpressionID", "Impressions"]])
-
-    news_text = news_text[
-        news_text["target_impression"].isin(behaviors_split["target_impression"])
-    ]
-
-    news_text["news_embedding"] = get_text_embed_eval(
-        text_model,
-        tokenizer,
-        news_text["news_text"],
-        get_text_inference_batch_size(text_model, news_text_max_len),
-        news_text_max_len,
-    )
-
-    behaviors_split = behaviors_split.merge(
-        news_text[["target_impression", "news_embedding"]], on="target_impression"
-    ).reset_index(drop=True)
-    return behaviors_split
-
-
-def head_preprocess_df(behaviors_split_df):
-    impressions = torch.tensor(
-        behaviors_split_df["ImpressionID"].values, dtype=torch.int32
-    )
-    embeddings = torch.tensor(
-        np.stack(behaviors_split_df["news_embedding"]), dtype=torch.float32
-    )
-    labels = torch.tensor(behaviors_split_df["target_result"].values, dtype=torch.int32)
-    return impressions, embeddings, labels
+    news_embeds = get_text_embed_eval(model, news_dataloader)
+    return news_embeds
 
 
 def head_train_epoch(
-    model, optimizer, loss_fn, impressions, embeddings, max_batch_size, labels
+    model,
+    optimizer,
+    loss_fn,
+    max_batch_size,
+    news_rev_index,
+    news_embeds,
+    imp_counts,
+    labels,
 ):
     device = model.device
     optimizer.zero_grad()
     cur_loss, num_items = 0, 0
-    for embeds, attn_mask, labs in pad_and_batch(
-        impressions, embeddings, max_batch_size, labels
+    for sub_emb_index, attn_mask, labs in pad_and_batch(
+        imp_counts, news_rev_index, max_batch_size, np.concatenate(labels)
     ):
+        attn_mask = torch.tensor(attn_mask, dtype=torch.int32)
         result = model(
-            embeddings=embeds.to(device),
+            embeddings=news_embeds[torch.tensor(sub_emb_index, dtype=torch.int32)].to(
+                device
+            ),
             attention_mask=attn_mask.to(device=device, dtype=torch.float32),
         ).last_hidden_state
         loss = loss_fn(
-            unpad(result, attn_mask).squeeze(), labs.to(device, dtype=torch.float32)
+            unpad(result, attn_mask).squeeze(),
+            torch.tensor(labs, device=device, dtype=torch.float32),
         )
         cur_loss += loss.item() * len(labs)
         num_items += len(labs)
@@ -96,28 +102,64 @@ def head_train_epoch(
     return cur_loss / num_items
 
 
-def head_eval_epoch(model, loss_fn, impressions, embeddings, max_batch_size, labels):
+def head_eval_epoch(
+    model, loss_fn, max_batch_size, news_rev_index, news_embeds, imp_counts, labels
+):
     device = model.device
-    res = use_head_model_eval(model, impressions, embeddings, max_batch_size).squeeze()
-    loss = loss_fn(res.to(device), labels.to(device, dtype=torch.float32)).item()
 
-    pred_df = pd.DataFrame(
-        {
-            "ImpressionID": impressions.numpy(),
-            "pred_scores": res.numpy(),
-            "label": labels.numpy(),
-        }
-    )
-    pred_df["preds"] = pred_df.groupby("ImpressionID")["pred_scores"].rank(
-        method="min", ascending=False
-    )
+    result_list = []
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
 
-    scoring_df = pred_df.groupby("ImpressionID")[["preds", "label"]].agg(list)
+    model.eval()
+    print("Evaluating using head")
+    pred_scores = use_head_model_eval(
+        model, imp_counts, news_rev_index, news_embeds, max_batch_size
+    ).squeeze()
 
-    scores_dict = score(scoring_df)
+    for i in range(len(imp_counts)):
+        result_list.append(
+            rankdata(
+                -pred_scores.numpy()[cumsum_lengths[i] : cumsum_lengths[i + 1]],
+                method="dense",
+            ).tolist()
+        )
+    scores_dict = score(np.array(result_list, dtype=object), labels)
+    loss = loss_fn(
+        pred_scores.to(device),
+        torch.tensor(np.concatenate(labels), device=device, dtype=torch.float32),
+    ).item()
     scores_dict["loss"] = loss
 
     return scores_dict
+
+
+def get_train_val_embed(
+    model_path,
+    device,
+    train_news_list,
+    train_news_text_dict,
+    val_news_list,
+    val_news_text_dict,
+    max_len,
+):
+    text_model, tokenizer = get_model_and_tokenizer(model_path, device=device)
+    train_news_embed = get_news_embeddings(
+        train_news_list, train_news_text_dict, max_len, text_model, tokenizer
+    )
+    val_news_embed = get_news_embeddings(
+        val_news_list, val_news_text_dict, max_len, text_model, tokenizer
+    )
+    return train_news_embed, val_news_embed
+
+
+def get_dataset(data_dir: Path, news_dataset: NewsDataset):
+    behaviors, news_text_dict = load_dataset(
+        data_dir, news_dataset, data_subset=DataSubset.WITHOUT_HISTORY
+    )
+    news_list, split_array, imp_counts, labels = split_impressions(
+        behaviors["Impressions"]
+    )
+    return news_text_dict, news_list, split_array, imp_counts, labels
 
 
 def train_head(
@@ -133,34 +175,32 @@ def train_head(
     device=DEVICE,
 ):
 
-    text_model, tokenizer = get_model_and_tokenizer(
-        text_embed_model_path, device=device
+    (
+        train_news_text_dict,
+        train_news_list,
+        train_split_array,
+        train_imp_counts,
+        train_labels,
+    ) = get_dataset(data_dir, train_news_dataset)
+    (
+        val_news_text_dict,
+        val_news_list,
+        val_split_array,
+        val_imp_counts,
+        val_labels,
+    ) = get_dataset(data_dir, val_news_dataset)
+
+    train_news_embed, val_news_embed = get_train_val_embed(
+        text_embed_model_path,
+        device,
+        train_news_list,
+        train_news_text_dict,
+        val_news_list,
+        val_news_text_dict,
+        news_text_max_len,
     )
 
     head_model = get_head_model(head_model_path, device=device)
-
-    if os.path.exists("temp_train.parquet"):
-        train_behaviors_split = pd.read_parquet("temp_train.parquet")
-    else:
-        train_behaviors_split = get_news_embeddings(
-            data_dir, train_news_dataset, text_model, tokenizer, news_text_max_len
-        )
-        train_behaviors_split.to_parquet("temp_train.parquet", index=False)
-
-    if os.path.exists("val_train.parquet"):
-        val_behaviors_split = pd.read_parquet("val_train.parquet")
-    else:
-        val_behaviors_split = get_news_embeddings(
-            data_dir, val_news_dataset, text_model, tokenizer, news_text_max_len
-        )
-        val_behaviors_split.to_parquet("val_train.parquet", index=False)
-
-    train_impressions, train_embeddings, train_labels = head_preprocess_df(
-        train_behaviors_split
-    )
-    val_impressions, val_embeddings, val_labels = head_preprocess_df(
-        val_behaviors_split
-    )
 
     optimizer = optim.AdamW(head_model.parameters(), lr=1e-4)
     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -173,21 +213,23 @@ def train_head(
             head_model,
             optimizer,
             loss_fn,
-            train_impressions,
-            train_embeddings,
             head_max_batch_size,
+            train_split_array[0],
+            train_news_embed,
+            train_imp_counts,
             train_labels,
         )
         head_model.eval()
         val_epoch_result = head_eval_epoch(
             head_model,
             loss_fn,
-            val_impressions,
-            val_embeddings,
             head_max_batch_size,
+            val_split_array[0],
+            val_news_embed,
+            val_imp_counts,
             val_labels,
         )
-        val_metric = np.mean(list(val_epoch_result.values()))
+        val_metric = float(np.mean(list(val_epoch_result.values())))
         scheduler.step(val_metric)
         print(
             f"Epoch: {i}, train_loss: {train_epoch_loss}, val_loss: {val_epoch_result}"

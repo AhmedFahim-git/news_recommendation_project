@@ -5,8 +5,6 @@ from transformers import (
     AutoModelForSequenceClassification,
 )
 import torch
-import torch.nn.functional as F
-from typing import Optional
 from .config import DEVICE, EMBEDDING_DIM, TORCH_DTYPE, HEAD_MAX_BATCH_SIZE, LORA_CONFIG
 from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
@@ -15,6 +13,7 @@ from transformers.modeling_outputs import (
 from tqdm import tqdm
 from contextlib import nullcontext
 from collections.abc import Callable
+import numpy as np
 from peft.mapping import get_peft_model
 
 # path = "Alibaba-NLP/gte-base-en-v1.5"
@@ -129,7 +128,7 @@ def get_sequence_classification_model(path, device=DEVICE):
 
 
 # To do. Try replacing with dataloader
-def get_text_embed_eval(model, tokenizer, text_col, batch_size, max_len):
+def get_text_embed_eval(model, input_dataloader):
     device = model.device
     pool_fn = output_pool(model)
     text_embed_list = []
@@ -139,21 +138,16 @@ def get_text_embed_eval(model, tokenizer, text_col, batch_size, max_len):
         else nullcontext()
     )
     with torch.no_grad(), cast_context:
-        for i in tqdm(range(0, len(text_col), batch_size)):
-            inputs = tokenizer(
-                text_col.iloc[i : i + batch_size].to_list(),
-                max_length=max_len,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            ).to(device)
-            text_embed_list += (
-                pool_fn(model(**inputs).last_hidden_state, inputs["attention_mask"])
+        for inputs in tqdm(input_dataloader, desc="Embedding Text"):
+            text_embed_list.append(
+                pool_fn(
+                    model(**inputs.to(device)).last_hidden_state,
+                    inputs["attention_mask"],
+                )
                 .detach()
                 .cpu()
-                .tolist()
             )
-    return text_embed_list
+    return torch.concatenate(text_embed_list)
 
 
 def get_head_model(path: str, device=DEVICE):
@@ -167,47 +161,45 @@ def get_head_model(path: str, device=DEVICE):
 
 
 def pad_and_batch(
-    impressions: torch.Tensor,
-    embeddings: torch.Tensor,
+    imp_lengths: np.ndarray,
+    embed_index: np.ndarray,
     max_batch_size: int = HEAD_MAX_BATCH_SIZE,
-    labels: Optional[torch.Tensor] = None,
+    labels: np.ndarray = np.array([]),
 ):
-    assert len(impressions) == len(embeddings)
-    _, lengths = torch.unique_consecutive(impressions, return_counts=True)
-    cumsum_lengths = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)])
-    assert max(lengths) <= max_batch_size
+    labs = np.array([])
+    cumsum_lengths = np.concatenate([[0], imp_lengths.cumsum()])
+    assert max(imp_lengths) <= max_batch_size
     start = 0
     end = 0
-    while end < len(lengths):
+    while end < len(imp_lengths):
         end = (cumsum_lengths <= (cumsum_lengths[start] + max_batch_size)).sum() - 1
-        max_len = lengths[start:end].max()
-        attn_mask = torch.stack(
+        max_len = imp_lengths[start:end].max()
+        attn_mask = np.stack(
             [
-                F.pad(
-                    torch.ones(i, dtype=torch.int32),
+                np.pad(
+                    np.ones(i, dtype=np.int32),
                     (0, max_len - i),
                     mode="constant",
-                    value=0,
+                    constant_values=0,
                 )
-                for i in lengths[start:end]
+                for i in imp_lengths[start:end]
             ]
         )
-        embeds = torch.stack(
+
+        sub_embeds_index = np.stack(
             [
-                F.pad(
-                    embeddings[cumsum_lengths[i] : cumsum_lengths[i + 1]],
-                    (0, 0, 0, max_len - lengths[i]),
+                np.pad(
+                    embed_index[cumsum_lengths[i] : cumsum_lengths[i + 1]],
+                    (0, max_len - imp_lengths[i]),
                     mode="constant",
-                    value=0,
+                    constant_values=0,
                 )
                 for i in range(start, end)
             ]
         )
-        if isinstance(labels, torch.Tensor):
+        if len(labels) > 0:
             labs = labels[cumsum_lengths[start] : cumsum_lengths[end]]
-            yield embeds, attn_mask, labs
-        else:
-            yield embeds, attn_mask
+        yield sub_embeds_index, attn_mask, labs
         start = end
 
 
@@ -218,17 +210,22 @@ def unpad(embeds, attn_mask):
 
 def use_head_model_eval(
     model: torch.nn.Module,
-    impressions: torch.Tensor,
+    imp_count: np.ndarray,
+    emb_index: np.ndarray,
     embeddings: torch.Tensor,
     max_batch_size: int = HEAD_MAX_BATCH_SIZE,
 ) -> torch.Tensor:
     device = model.device
     pred_scores = []
-    for i, j in pad_and_batch(impressions, embeddings, max_batch_size):
+    for sub_emb_index, attn_mask, _ in pad_and_batch(
+        imp_count, emb_index, max_batch_size
+    ):
+        sub_emb = embeddings[torch.tensor(sub_emb_index, dtype=torch.int32)]
+        attn_mask = torch.tensor(attn_mask, dtype=torch.int32)
         with torch.no_grad():
             res = model(
-                i.to(device), j.to(device=device, dtype=torch.float32)
+                sub_emb.to(device), attn_mask.to(device=device, dtype=torch.float32)
             ).last_hidden_state
-        pred_scores.append(unpad(res.cpu(), j))
+        pred_scores.append(unpad(res.cpu(), attn_mask))
 
     return torch.cat(pred_scores)

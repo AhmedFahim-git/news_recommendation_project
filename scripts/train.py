@@ -1,8 +1,7 @@
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import DataLoader
 import torch
 from functools import partial
 from torch import optim
-import torch.nn.functional as F
 from tqdm import tqdm
 import logging
 from news_rec_utils.config import (
@@ -11,10 +10,12 @@ from news_rec_utils.config import (
     HISTORY_TEXT_MAXLEN,
     NEWS_TEXT_MAXLEN,
     MODEL_PATH,
+    DataSubset,
 )
 from news_rec_utils.batch_size_finder import get_text_train_batch_size
 from news_rec_utils.modelling import get_model_and_tokenizer, output_pool
-from news_rec_utils.prepare_data import split_behaviors
+from news_rec_utils.prepare_data import train_collate_fn, TextTrainDataset, load_dataset
+from news_rec_utils.evaluate import evaluate_df
 import pandas as pd
 from torch.profiler import profile, ProfilerActivity, schedule
 from contextlib import nullcontext
@@ -23,6 +24,7 @@ from typing import Optional
 from pathlib import Path
 import numpy as np
 import argparse
+import json
 
 torch.manual_seed(1234)
 
@@ -31,192 +33,56 @@ logging.basicConfig(
     filename="mytrain.log", level=logging.INFO, format="%(asctime)s %(message)s"
 )
 
+
 # to do only training params in float32
-
-
-def collate_fn(input, tokenizer, history_max_len, news_text_max_len):
-    history_text, news_text, labels = zip(*input)
-    history_counts = pd.Series(history_text).value_counts(sort=False)
-    return (
-        tokenizer(
-            history_counts.index.to_list(),
-            max_length=history_max_len,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ),
-        tokenizer(
-            news_text,
-            max_length=news_text_max_len,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ),
-        torch.tensor(history_counts.values, dtype=torch.int32),
-        torch.tensor(labels) * 2 - 1,
+def eval_model_subset(
+    data_dir: Path,
+    news_dataset: NewsDataset,
+    num_samples: int,
+    random_state: np.random.Generator,
+    model,
+    tokenizer,
+    epoch: int,
+    batch: int,
+):
+    behaviors, news_text_dict = load_dataset(
+        data_dir, news_dataset, num_samples, DataSubset.WITH_HISTORY, random_state
     )
-
-
-class TextDataset(Dataset):
-    def __init__(self, data_dir: Path, news_dataset: NewsDataset, batch_size: int):
-        behaviors = pd.read_parquet(
-            data_dir / "processed" / news_dataset.value / "behaviors.parquet"
-        )
-        history_text = pd.read_parquet(
-            data_dir / "processed" / news_dataset.value / "history_text.parquet"
-        )
-        news_text = pd.read_parquet(
-            data_dir / "processed" / news_dataset.value / "news_text.parquet"
-        )
-
-        behaviors = behaviors[behaviors["History"].notna()].reset_index(drop=True)
-        news_text = news_text.rename(columns={"NewsID": "target_impression"})
-
-        behaviors = behaviors.merge(history_text[["History", "text"]], on="History")
-
-        behaviors_split = split_behaviors(
-            behaviors[["ImpressionID", "Impressions", "text"]]
-        )
-        behaviors_split = (
-            behaviors_split.merge(
-                news_text[["target_impression", "news_text"]],
-                on="target_impression",
-            )[["ImpressionID", "text", "news_text", "target_result"]]
-            .rename(columns={"target_result": "label"})
-            .reset_index(drop=True)
-        )
-        self.num_batches = int(
-            min(
-                -(len(behaviors_split) // -batch_size)
-                - int((len(behaviors_split) % batch_size) == 1),
-                behaviors_split["label"].sum(),
-            )
-        )
-        self.dataset_size = min(self.num_batches * batch_size, len(behaviors_split))
-        self.impression_label = behaviors_split[["ImpressionID", "label"]]
-
-        self.behaviors_split = behaviors_split.drop(columns=["ImpressionID"])
-        print(
-            f"Input dataset size: {len(behaviors_split)}, Using size: {self.dataset_size}"
-        )
-
-    def __len__(self):
-        return self.dataset_size
-
-    def __getitem__(self, idx):
-        row = self.behaviors_split.iloc[idx]
-        return row["text"], row["news_text"], row["label"]
-
-
-class TrainSampler(Sampler):
-    def __init__(self, dataset: TextDataset, batch_size: int):
-        self.impression_label = dataset.impression_label
-        self.dataset_size = dataset.dataset_size
-        self.num_batches = dataset.num_batches
-        self.batch_size = batch_size
-        self.rng = np.random.default_rng(1234)
-        self.num_zero = self.dataset_size - self.impression_label["label"].sum()
-        self.max_zero = self._get_max_zero()
-
-    def _get_max_zero(self):
-
-        zero_imp_counts = self.impression_label[self.impression_label["label"] == 0][
-            "ImpressionID"
-        ].value_counts()
-        l = self.num_zero // len(zero_imp_counts)
-        h = zero_imp_counts.max()
-        while h - l > 1:
-            m = l + (h - l) // 2
-            if zero_imp_counts.apply(lambda x: min(x, m)).sum() >= self.num_zero:
-                h = m
-            else:
-                l = m
-        return h
-
-    def __len__(self):
-        return self.dataset_size
-
-    def _get_slice_indices(self):
-        temp_copy = self.impression_label.copy()
-        mappings = pd.Series(
-            data=self.rng.permutation(temp_copy["ImpressionID"].unique()),
-            index=temp_copy["ImpressionID"].unique(),
-        ).to_dict()
-        temp_copy["ImpressionID"] = temp_copy["ImpressionID"].map(mappings)
-        temp_copy = temp_copy.sort_values("ImpressionID").reset_index()
-        temp_copy = temp_copy.groupby("ImpressionID").sample(
-            frac=1, random_state=self.rng
-        )
-
-        temp_zero = temp_copy[temp_copy["label"] == 0][
-            temp_copy[temp_copy["label"] == 0]
-            .groupby("ImpressionID", sort=False)
-            .cumcount()
-            < self.max_zero
-        ]
-        temp_one = temp_copy[temp_copy["label"] == 1]
-
-        grouped = temp_zero.groupby("ImpressionID", sort=False).cumcount() == (
-            self.max_zero - 1
-        )
-        temp_zero = temp_zero[
-            (((grouped).cumsum() > (len(temp_zero) - self.num_zero)) | (~grouped))
-        ]
-
-        if (len(temp_zero) % self.num_batches) == 0:
-            zero_chunks = np.split(temp_zero["index"].values, self.num_batches)
-        else:
-            zero_chunks = np.split(
-                temp_zero["index"].values[: -(len(temp_zero) % (self.num_batches - 1))],
-                self.num_batches - 1,
-            ) + [
-                temp_zero["index"].values[-(len(temp_zero) % (self.num_batches - 1)) :]
-            ]
-
-        if (len(temp_one) % self.num_batches) == 0:
-            one_chunks = np.split(temp_one["index"].values, self.num_batches)
-        else:
-            one_chunks = np.split(
-                temp_one["index"].values[: -(len(temp_one) % (self.num_batches - 1))],
-                self.num_batches - 1,
-            ) + [temp_one["index"].values[-(len(temp_one) % (self.num_batches - 1)) :]]
-
-        all_chunks = []
-        for i in range(self.num_batches):
-            all_chunks.append(zero_chunks[i])
-            all_chunks.append(one_chunks[i])
-
-        temp_copy = pd.DataFrame({"final_index": np.concatenate(all_chunks)})
-
-        batches = np.arange(self.num_batches)
-        self.rng.shuffle(batches[:-1])
-        temp_copy["Final_order"] = np.repeat(batches, self.batch_size)[: len(temp_copy)]
-        temp_copy = temp_copy.sort_values("Final_order")
-        return temp_copy["final_index"]
-
-    def __iter__(self):
-        yield from self._get_slice_indices()
+    score_dict = evaluate_df(
+        behaviors, news_text_dict, output_dir=None, model=model, tokenizer=tokenizer
+    )
+    final_dict = {"epoch": epoch, "batch": batch, "scores": score_dict}
+    with open("./eval_score.jsonl", "a") as f:
+        f.write(json.dumps(final_dict) + "\n")
 
 
 class TextModelTrainer:
     def __init__(
         self,
         data_dir: Path,
-        news_dataset: NewsDataset,
+        train_news_dataset: NewsDataset,
+        val_news_dataset: NewsDataset,
+        num_val: int,
         model_path,
         history_max_len=HISTORY_TEXT_MAXLEN,
         news_text_max_len=NEWS_TEXT_MAXLEN,
         device=DEVICE,
-        ckpt_steps=1000,
+        ckpt_steps=50,
         warmup_steps=100,
     ):
         self.device = device
+        self.rng = np.random.default_rng(1234)
         self.ckpt_steps = ckpt_steps
+        self.data_dir = data_dir
+        self.val_news_dataset = val_news_dataset
+        self.num_val = num_val
         self.model, self.tokenizer = get_model_and_tokenizer(
             model_path, peft_model=True, device=device
         )
         self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-3)
-        self.loss_fn = torch.nn.CosineEmbeddingLoss()
+        self.loss_fn = torch.nn.TripletMarginWithDistanceLoss(
+            distance_function=torch.nn.CosineSimilarity()
+        )
         self.pool_fn = output_pool(self.model)
 
         batch_size = get_text_train_batch_size(
@@ -225,20 +91,21 @@ class TextModelTrainer:
         print(f"Batch size: {batch_size}")
 
         partial_collate = partial(
-            collate_fn,
+            train_collate_fn,
             tokenizer=self.tokenizer,
             history_max_len=history_max_len,
             news_text_max_len=news_text_max_len,
         )
 
-        train_dataset = TextDataset(data_dir, news_dataset, batch_size)
-        sampler = TrainSampler(train_dataset, batch_size)
+        train_dataset = TextTrainDataset(
+            data_dir, train_news_dataset, batch_size, rng=self.rng
+        )
         self.train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             pin_memory=True,
             num_workers=2,
-            sampler=sampler,
+            shuffle=False,
             collate_fn=partial_collate,
         )
 
@@ -263,31 +130,26 @@ class TextModelTrainer:
                 self.scaler = torch.amp.GradScaler(device.type)
 
     def train_one_batch(self, inputs):
-        history_text_tokenized, news_text_tokenized, history_repeats, label = inputs
+        history_text_tokenized, history_index, news_text_tokenized, news_index = inputs
+        self.model.train()
         self.optimizer.zero_grad()
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.cast_dtype,
         ):
-            text_embed = self.pool_fn(
+            history_text_embed = self.pool_fn(
                 self.model(**history_text_tokenized.to(self.device)).last_hidden_state,
                 history_text_tokenized["attention_mask"],
             )
 
             news_text_embed = self.pool_fn(
                 self.model(**news_text_tokenized.to(self.device)).last_hidden_state,
-                history_text_tokenized["attention_mask"],
+                news_text_tokenized["attention_mask"],
             )
 
             loss = self.loss_fn(
-                torch.repeat_interleave(
-                    text_embed,
-                    history_repeats.to("cuda"),
-                    dim=0,
-                    output_size=sum(history_repeats),
-                ),
-                news_text_embed,
-                label.to(self.device),
+                history_text_embed[history_index.to(self.device)],
+                *torch.chunk(news_text_embed[news_index.to(self.device)], 2),
             )
 
         if self.scaler:
@@ -333,13 +195,30 @@ class TextModelTrainer:
                 running_loss += self.train_one_batch(inputs)
                 if do_batch_profiling:
                     prof.step()
-                if (i + 1) % 200 == 0:
+                if (i + 1) % self.ckpt_steps == 0:
                     last_loss = running_loss / self.ckpt_steps  # loss per batch
                     # print("Epoch {}  batch {} loss: {}".format(epoch, i + 1, last_loss))
+                    with open("./train_loss.jsonl", "a") as f:
+                        f.write(
+                            json.dumps(
+                                {"epoch": epoch + 1, "batch": i + 1, "loss": last_loss}
+                            )
+                            + "\n"
+                        )
                     logger.info(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
                     print(f"Epoch {epoch+1}  batch {i+1} loss: {last_loss}")
                     # logger.info(torch.cuda.memory_summary())
                     running_loss = 0.0
+                    eval_model_subset(
+                        data_dir=self.data_dir,
+                        news_dataset=self.val_news_dataset,
+                        num_samples=self.num_val,
+                        random_state=self.rng,
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        epoch=epoch + 1,
+                        batch=i + 1,
+                    )
 
                 if (i + 1) % self.ckpt_steps == 0:
                     if ckpt_dir:
@@ -378,9 +257,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "news_dataset",
+        "train_news_dataset",
         choices=NewsDataset._member_names_,
         help="Select the news dataset",
+    )
+
+    parser.add_argument(
+        "--val_news_dataset",
+        choices=NewsDataset._member_names_,
+        default="MINDsmall_dev",
+        help="Select the news dataset",
+    )
+
+    parser.add_argument(
+        "--num_val",
+        type=int,
+        default=100,
+        help="Select the number of use to eval",
     )
 
     # Optional arguments
@@ -402,6 +295,12 @@ if __name__ == "__main__":
         default=100,
         help="Select the number of warmup steps",
     )
+    parser.add_argument(
+        "--ckpt_steps",
+        type=int,
+        default=50,
+        help="Select the number of steps for checkpoint",
+    )
 
     args = parser.parse_args()
 
@@ -410,10 +309,16 @@ if __name__ == "__main__":
         parser.error(f"The path '{args.data_dir}' is not a valid directory.")
 
     # Convert dataset name to Enum
-    news_dataset = NewsDataset[args.news_dataset]
+    train_news_dataset = NewsDataset[args.train_news_dataset]
+    val_news_dataset = NewsDataset[args.val_news_dataset]
 
     trainer = TextModelTrainer(
-        args.data_dir, news_dataset, args.model_path, warmup_steps=args.warmup_steps
+        args.data_dir,
+        train_news_dataset,
+        val_news_dataset,
+        args.num_val,
+        args.model_path,
+        warmup_steps=args.warmup_steps,
+        ckpt_steps=args.ckpt_steps,
     )
-    # ckpt_dir = Path("model_ckpt")
     trainer.train(1, args.ckpt_dir, False)

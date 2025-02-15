@@ -1,18 +1,213 @@
 import pandas as pd
-from typing import Iterable, Optional
-from .config import NewsDataset, EMBEDDING_SYSTEM_PROMPT
+from .config import NewsDataset, EMBEDDING_SYSTEM_PROMPT, DataSubset
 from pathlib import Path
 import argparse
+from tqdm import tqdm
+from typing import Optional
+import numpy as np
+from torch.utils.data import Dataset
+import torch
 
-# import click
 
-# TO_DO add logging
+def train_collate_fn(input, tokenizer, history_max_len, news_text_max_len):
+    history_text, news_text_pos, news_text_neg = zip(*input)
+    history_unique, history_rev_index = np.unique(history_text, return_inverse=True)
+    all_news = np.concatenate((news_text_pos, news_text_neg))
+    news_unique, news_rev_index = np.unique(all_news, return_inverse=True)
+    return (
+        tokenizer(
+            history_unique.tolist(),
+            max_length=history_max_len,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        ),
+        torch.tensor(history_rev_index),
+        tokenizer(
+            news_unique.tolist(),
+            max_length=news_text_max_len,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        ),
+        torch.tensor(news_rev_index),
+    )
+
+
+def eval_collate_fn(input, tokenizer, max_len):
+    return tokenizer(
+        input,
+        max_length=max_len,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+
+class HistoryDataset(Dataset):
+    def __init__(self, history_list, news_text_dict: dict[str, str]):
+        self.history_list = history_list
+        self.news_text_dict = news_text_dict
+
+    def __len__(self):
+        return len(self.history_list)
+
+    def __getitem__(self, idx):
+        return EMBEDDING_SYSTEM_PROMPT + "\n".join(
+            map(
+                lambda x: self.news_text_dict[x],
+                self.history_list[idx].split()[::-1],
+            )
+        )
+
+
+class NewsTextDataset(Dataset):
+    def __init__(self, news_list, news_text_dict: dict[str, str]):
+        self.news_list = news_list
+        self.news_text_dict = news_text_dict
+
+    def __len__(self):
+        return len(self.news_list)
+
+    def __getitem__(self, idx):
+        return self.news_text_dict[self.news_list[idx]]
+
+
+class TextTrainDataset(Dataset):
+    def __init__(
+        self,
+        data_dir: Path,
+        news_dataset: NewsDataset,
+        batch_size: int,
+        rng=np.random.default_rng(1234),
+    ):
+        self.rng = rng
+        behaviors, self.news_text_dict = load_dataset(
+            data_dir, news_dataset, data_subset=DataSubset.WITH_HISTORY
+        )
+
+        behaviors = behaviors.sample(
+            frac=1, replace=False, random_state=self.rng
+        ).reset_index(drop=True)
+        self.history = behaviors["History"].values
+
+        self.news_list, self.final_array = self._def_split_impressions(
+            behaviors["Impressions"]
+        )
+
+        num_batches = -(self.final_array.shape[1] // -batch_size)
+        permuted_list = self.rng.permutation(num_batches - 1).tolist() + [
+            num_batches - 1
+        ]
+        final_index = np.concatenate(
+            [np.arange(i * batch_size, (i + 1) * batch_size) for i in permuted_list]
+        )[: self.final_array.shape[1]]
+        self.final_array = self.final_array[:, final_index]
+
+        print(
+            "Input dataset size: {}, Using size: {}".format(
+                behaviors["Impressions"].str.count("N").sum(), self.final_array.shape[1]
+            )
+        )
+
+    def _def_split_impressions(self, impressions) -> tuple[np.ndarray, np.ndarray]:
+        cur = 0
+        pos_dict = dict()
+        len_list = []
+        news_list = []
+        pos_ind = []
+        neg_ind = []
+        for row in tqdm(impressions, desc="Splitting impressions"):
+            temp_pos, temp_neg = [], []
+            news, label = zip(
+                *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
+            )
+            num_pos = sum(label)
+            num_neg = len(label) - num_pos
+            max_len = max(num_neg, num_pos)
+            for i in range(len(label)):
+                if news[i] not in pos_dict:
+                    pos_dict[news[i]] = cur
+                    cur += 1
+                    news_list.append(news[i])
+                if label[i] == 0:
+                    temp_neg.append(pos_dict[news[i]])
+                else:
+                    temp_pos.append(pos_dict[news[i]])
+            temp_pos = self.rng.permutation(
+                np.append(temp_pos, self.rng.choice(temp_pos, max_len - num_pos))
+            )
+            temp_neg = self.rng.permutation(
+                np.append(temp_neg, self.rng.choice(temp_neg, max_len - num_neg))
+            )
+
+            pos_ind.extend(temp_pos.tolist())
+            neg_ind.extend(temp_neg.tolist())
+            len_list.append(max_len)
+
+        return np.array(news_list), np.stack(
+            [
+                np.array(pos_ind, dtype=np.int32),
+                np.array(neg_ind, dtype=np.int32),
+                np.concatenate(
+                    [[i] * n for i, n in enumerate(len_list)], dtype=np.int32
+                ),
+            ]
+        )
+
+    def __len__(self):
+        return self.final_array.shape[1]
+
+    def __getitem__(self, idx):
+        return (
+            EMBEDDING_SYSTEM_PROMPT
+            + "\n".join(
+                map(
+                    lambda x: self.news_text_dict[x],
+                    self.history[self.final_array[2, idx]].split()[::-1],
+                )
+            ),
+            self.news_text_dict[self.news_list[self.final_array[0, idx]]],
+            self.news_text_dict[self.news_list[self.final_array[1, idx]]],
+        )
+
+
+def load_dataset(
+    data_dir: Path,
+    news_dataset: NewsDataset,
+    num_samples: Optional[int] = None,
+    data_subset: Optional[DataSubset] = DataSubset.ALL,
+    random_state: int | np.random.Generator = 1234,
+):
+    behaviors = pd.read_parquet(
+        data_dir / "processed" / news_dataset.value / "behaviors.parquet",
+        columns=["ImpressionID", "History", "Impressions"],
+    )
+    news_text_dict: dict[str, str] = (
+        pd.read_parquet(
+            data_dir / "processed" / news_dataset.value / "news_text.parquet"
+        )
+        .set_index("NewsID")["news_text"]
+        .to_dict()
+    )
+    if data_subset == DataSubset.WITH_HISTORY:
+        behaviors = behaviors[behaviors["History"].notna()].reset_index(drop=True)
+    elif data_subset == DataSubset.WITHOUT_HISTORY:
+        behaviors = behaviors[behaviors["History"].isna()].reset_index(drop=True)
+    if num_samples and num_samples < len(behaviors):
+        behaviors = behaviors.sample(
+            n=num_samples, random_state=random_state, replace=False
+        ).reset_index(drop=True)
+        # behaviors = behaviors.iloc[:num_samples]
+
+    return behaviors, news_text_dict
 
 
 def read_data(
     data_dir: Path,
     news_dataset: NewsDataset,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    print("Reading behaviors.tsv data")
     behaviors = pd.read_csv(
         data_dir / "raw" / news_dataset.value / "behaviors.tsv",
         sep="\t",
@@ -20,6 +215,8 @@ def read_data(
         names=["ImpressionID", "UserID", "Time", "History", "Impressions"],
         parse_dates=["Time"],
     )
+
+    print("Reading news.tsv data")
     news = pd.read_csv(
         data_dir / "raw" / news_dataset.value / "news.tsv",
         sep="\t",
@@ -35,15 +232,12 @@ def read_data(
             "Abstract Entities",
         ],
     )
-    news["news_text"] = news.apply(
-        lambda x: f"Title: {x['Title']}\nAbstract: {x['Abstract']}\nCategory: {x['Category']}\nSubCategory: {x['SubCategory']}",
-        axis=1,
-    )
 
     return behaviors, news
 
 
 def process_news(news_df: pd.DataFrame) -> pd.DataFrame:
+    print("Making news_text column for the news data")
     news_df["news_text"] = news_df.apply(
         lambda x: f"Title: {x['Title']}\nAbstract: {x['Abstract']}\nCategory: {x['Category']}\nSubCategory: {x['SubCategory']}",
         axis=1,
@@ -51,96 +245,62 @@ def process_news(news_df: pd.DataFrame) -> pd.DataFrame:
     return news_df
 
 
-def filter_news(news_df: pd.DataFrame, impressions: Iterable[str]) -> pd.DataFrame:
-    return news_df[news_df["NewsID"].isin(impressions)]
+def split_impressions(impressions):
+    assert len(impressions) > 0, "No Impressions given"
+    label_present = "-" in impressions[0]
+    cur = 0
+    pos_dict = dict()
+    news_list = []
+    rev_ind = []
+    labels = []
+    len_list = []
+    for row in tqdm(impressions, desc="Splitting impressions"):
+        if label_present:
+            news_sub_list, label = zip(
+                *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
+            )
+            labels.append(label)
+        else:
+            news_sub_list = row.split()
+        len_list.append(len(news_sub_list))
+        for news in news_sub_list:
+            if news not in pos_dict:
+                pos_dict[news] = cur
+                cur += 1
+                news_list.append(news)
 
-
-def remove_no_history_users(behaviors_df: pd.DataFrame) -> pd.DataFrame:
-
-    no_history_users = behaviors_df[behaviors_df["History"].isna()]["UserID"].unique()
-    return behaviors_df[~behaviors_df["UserID"].isin(no_history_users)].reset_index(
-        drop=True
+            rev_ind.append(pos_dict[news])
+    return (
+        np.array(news_list),
+        np.stack(
+            [
+                np.array(rev_ind, dtype=np.int32),
+                np.concatenate(
+                    [[i] * n for i, n in enumerate(len_list)], dtype=np.int32
+                ),
+            ]
+        ),
+        np.array(len_list, dtype=np.int32),
+        np.array(labels, dtype=object),
     )
-
-
-def split_behaviors(behaviors_df: pd.DataFrame) -> pd.DataFrame:
-    behaviors_df = behaviors_df.copy(deep=True)
-    behaviors_df["Split_impressions"] = behaviors_df["Impressions"].str.split()
-
-    behaviors_split = behaviors_df.explode("Split_impressions", ignore_index=True)
-    behaviors_split["impression_num"] = behaviors_split.groupby(
-        "ImpressionID"
-    ).cumcount()
-    behaviors_split[["target_impression", "target_result"]] = behaviors_split[
-        "Split_impressions"
-    ].str.split("-", n=1, expand=True)
-    behaviors_split["target_result"] = pd.to_numeric(behaviors_split["target_result"])
-    return behaviors_split.drop(columns=["Split_impressions"])
-
-
-def get_unique_behavior_text(
-    behaviors_df: pd.DataFrame,
-    news_df: pd.DataFrame,
-    embedding_system_prompt: Optional[str] = EMBEDDING_SYSTEM_PROMPT,
-) -> pd.DataFrame:
-    unique_history = pd.DataFrame(
-        behaviors_df["History"].dropna().unique(), columns=["History"]
-    )
-    unique_history = unique_history.reset_index(names="HistoryID")
-    unique_history["split_history"] = (
-        unique_history["History"].str.split().apply(lambda x: x[::-1])
-    )
-    unique_history = unique_history.explode("split_history", ignore_index=True)
-    unique_history["history_num"] = unique_history.groupby("HistoryID").cumcount() + 1
-    unique_history = unique_history.rename(columns={"split_history": "NewsID"})
-    unique_history["NewsID"] = unique_history["NewsID"].str.strip()
-    unique_history = unique_history.merge(news_df, on="NewsID")
-    unique_history["text"] = unique_history.apply(
-        lambda x: f"{x['history_num']}. {x['news_text']}", axis=1
-    )
-    history_text = (
-        unique_history.groupby(["HistoryID", "History"])["text"]
-        .agg(
-            lambda x: "\n".join(x),
-        )
-        .reset_index()
-    )
-    if embedding_system_prompt:
-        history_text["text"] = history_text["text"].apply(
-            lambda x: embedding_system_prompt + x
-        )
-    return history_text
 
 
 def get_data(
     data_dir: Path,
     news_dataset: NewsDataset,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     behaviors, news = read_data(data_dir, news_dataset)
-    target_impressions = (
-        behaviors["Impressions"].str.split().explode().str.slice(stop=-2).unique()
-    )
-    # behaviors = remove_no_history_users(behaviors)
-    # behaviors_split = split_behaviors(behaviors)
+
+    print("Getting list of target impressions for final filtering of news dataset")
 
     news = process_news(news)
-
-    # history_text = get_unique_behavior_text(behaviors_split, news)
-    # history_text = get_unique_behavior_text(
-    #     behaviors_split[behaviors_split["History"].notna()], news
-    # )
-    history_text = get_unique_behavior_text(
-        behaviors[behaviors["History"].notna()], news
-    )
-    # news = filter_news(news, target_impressions)
-    news = news[news["NewsID"].isin(target_impressions)].reset_index(drop=True)
-    # news = filter_news(news, behaviors_split["target_impression"])
-    # return behaviors_split, news, history_text
-    return behaviors, news, history_text
+    return behaviors, news
 
 
 def store_processed_data(data_dir: Path, news_dataset: NewsDataset) -> None:
-    behaviors, news_text, history_text = get_data(data_dir, news_dataset)
+    behaviors, news_text = get_data(data_dir, news_dataset)
+
+    print("Saving datasets")
     (data_dir / "processed" / news_dataset.value).mkdir(parents=True, exist_ok=True)
     behaviors.to_parquet(
         data_dir / "processed" / news_dataset.value / "behaviors.parquet"
@@ -148,16 +308,6 @@ def store_processed_data(data_dir: Path, news_dataset: NewsDataset) -> None:
     news_text.to_parquet(
         data_dir / "processed" / news_dataset.value / "news_text.parquet"
     )
-    history_text.to_parquet(
-        data_dir / "processed" / news_dataset.value / "history_text.parquet"
-    )
-
-
-# @click.command()
-# @click.argument("data_dir", type=click.Path(True, dir_okay=True, path_type=Path))
-# @click.argument("news_dataset", type=click.Choice(choices=NewsDataset._member_names_))
-# def main(data_dir, news_dataset):
-#     store_processed_data(data_dir, NewsDataset[news_dataset])
 
 
 def main():
