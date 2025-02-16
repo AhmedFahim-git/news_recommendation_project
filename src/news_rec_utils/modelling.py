@@ -217,6 +217,7 @@ def use_head_model_eval(
 ) -> torch.Tensor:
     device = model.device
     pred_scores = []
+
     for sub_emb_index, attn_mask, _ in pad_and_batch(
         imp_count, emb_index, max_batch_size
     ):
@@ -228,4 +229,44 @@ def use_head_model_eval(
             ).last_hidden_state
         pred_scores.append(unpad(res.cpu(), attn_mask))
 
+    return torch.cat(pred_scores)
+
+
+def use_head_model_eval_with_history(
+    model: torch.nn.Module,
+    imp_count: np.ndarray,
+    news_rev_index: np.ndarray,
+    news_embeds: torch.Tensor,
+    history_embed: torch.Tensor,
+    history_rev_index,
+    max_batch_size: int = HEAD_MAX_BATCH_SIZE,
+):
+    device = model.device
+    num_items = 0
+    pred_scores = []
+    for sub_emb_index, attn_mask, _ in pad_and_batch(
+        imp_count,
+        news_rev_index,
+        max_batch_size,
+    ):
+        sub_history = history_embed[history_rev_index][
+            num_items : num_items + len(attn_mask)
+        ].unsqueeze(1)
+        extra_attn = np.ones((len(attn_mask), 1), dtype=np.int32)
+        num_items += len(attn_mask)
+        attn_mask = torch.tensor(
+            np.concatenate([extra_attn, attn_mask], axis=1), dtype=torch.int32
+        )
+        with torch.no_grad():
+            result = model(
+                embeddings=torch.cat(
+                    [
+                        sub_history,
+                        news_embeds[torch.tensor(sub_emb_index, dtype=torch.int32)],
+                    ],
+                    dim=1,
+                ).to(device),
+                attention_mask=attn_mask.to(device=device, dtype=torch.float32),
+            ).last_hidden_state
+        pred_scores.append(unpad(result[:, 1:].detach().cpu(), attn_mask[:, 1:]))
     return torch.cat(pred_scores)
