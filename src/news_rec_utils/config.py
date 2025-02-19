@@ -48,6 +48,8 @@ Below are the news articles read by the user in reverse chronological order. Ple
 User's Past News Articles (in reverse chronological order):
 """
 
+NEWS_CLASSIFICATION_PROMPT = "Please analyze the following news article to inform if the user would read the following news article.\nThe news article is: "
+
 TORCH_DTYPE = torch.float32
 
 NUM_WORKERS = 2

@@ -1,5 +1,10 @@
 import pandas as pd
-from .config import NewsDataset, EMBEDDING_SYSTEM_PROMPT, DataSubset
+from .config import (
+    NewsDataset,
+    EMBEDDING_SYSTEM_PROMPT,
+    DataSubset,
+    NEWS_CLASSIFICATION_PROMPT,
+)
 from pathlib import Path
 import argparse
 from tqdm import tqdm
@@ -7,31 +12,7 @@ from typing import Optional
 import numpy as np
 from torch.utils.data import Dataset
 import torch
-
-
-def train_collate_fn(input, tokenizer, history_max_len, news_text_max_len):
-    history_text, news_text_pos, news_text_neg = zip(*input)
-    history_unique, history_rev_index = np.unique(history_text, return_inverse=True)
-    all_news = np.concatenate((news_text_pos, news_text_neg))
-    news_unique, news_rev_index = np.unique(all_news, return_inverse=True)
-    return (
-        tokenizer(
-            history_unique.tolist(),
-            max_length=history_max_len,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ),
-        torch.tensor(history_rev_index),
-        tokenizer(
-            news_unique.tolist(),
-            max_length=news_text_max_len,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ),
-        torch.tensor(news_rev_index),
-    )
+from abc import ABC, abstractmethod
 
 
 def eval_collate_fn(input, tokenizer, max_len):
@@ -68,26 +49,75 @@ class NewsTextDataset(Dataset):
         return self.news_text_dict[self.news_list[idx]]
 
 
-class TextTrainDataset(Dataset):
+def _split_impressions_train(
+    rng: np.random.Generator, impressions
+) -> tuple[np.ndarray, np.ndarray]:
+    cur = 0
+    pos_dict = dict()
+    len_list = []
+    news_list = []
+    pos_ind = []
+    neg_ind = []
+    for row in tqdm(impressions, desc="Splitting impressions"):
+        temp_pos, temp_neg = [], []
+        news, label = zip(
+            *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
+        )
+        num_pos = sum(label)
+        num_neg = len(label) - num_pos
+        max_len = max(num_neg, num_pos)
+        for i in range(len(label)):
+            if news[i] not in pos_dict:
+                pos_dict[news[i]] = cur
+                cur += 1
+                news_list.append(news[i])
+            if label[i] == 0:
+                temp_neg.append(pos_dict[news[i]])
+            else:
+                temp_pos.append(pos_dict[news[i]])
+        temp_pos = rng.permutation(
+            np.append(temp_pos, rng.choice(temp_pos, max_len - num_pos))
+        )
+        temp_neg = rng.permutation(
+            np.append(temp_neg, rng.choice(temp_neg, max_len - num_neg))
+        )
+
+        pos_ind.extend(temp_pos.tolist())
+        neg_ind.extend(temp_neg.tolist())
+        len_list.append(max_len)
+
+    return np.array(news_list), np.stack(
+        [
+            np.array(pos_ind, dtype=np.int32),
+            np.array(neg_ind, dtype=np.int32),
+            np.concatenate([[i] * n for i, n in enumerate(len_list)], dtype=np.int32),
+        ]
+    )
+
+
+class AbstractTextTrainDataset(Dataset, ABC):
     def __init__(
         self,
         data_dir: Path,
         news_dataset: NewsDataset,
         batch_size: int,
+        include_history: bool,
+        data_subset: DataSubset,
         rng=np.random.default_rng(1234),
     ):
         self.rng = rng
         behaviors, self.news_text_dict = load_dataset(
-            data_dir, news_dataset, data_subset=DataSubset.WITH_HISTORY
+            data_dir, news_dataset, data_subset=data_subset
         )
 
         behaviors = behaviors.sample(
             frac=1, replace=False, random_state=self.rng
         ).reset_index(drop=True)
-        self.history = behaviors["History"].values
+        if include_history:
+            self.history = behaviors["History"].values
 
-        self.news_list, self.final_array = self._def_split_impressions(
-            behaviors["Impressions"]
+        self.news_list, self.final_array = _split_impressions_train(
+            self.rng, behaviors["Impressions"]
         )
 
         num_batches = -(self.final_array.shape[1] // -batch_size)
@@ -105,53 +135,33 @@ class TextTrainDataset(Dataset):
             )
         )
 
-    def _def_split_impressions(self, impressions) -> tuple[np.ndarray, np.ndarray]:
-        cur = 0
-        pos_dict = dict()
-        len_list = []
-        news_list = []
-        pos_ind = []
-        neg_ind = []
-        for row in tqdm(impressions, desc="Splitting impressions"):
-            temp_pos, temp_neg = [], []
-            news, label = zip(
-                *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
-            )
-            num_pos = sum(label)
-            num_neg = len(label) - num_pos
-            max_len = max(num_neg, num_pos)
-            for i in range(len(label)):
-                if news[i] not in pos_dict:
-                    pos_dict[news[i]] = cur
-                    cur += 1
-                    news_list.append(news[i])
-                if label[i] == 0:
-                    temp_neg.append(pos_dict[news[i]])
-                else:
-                    temp_pos.append(pos_dict[news[i]])
-            temp_pos = self.rng.permutation(
-                np.append(temp_pos, self.rng.choice(temp_pos, max_len - num_pos))
-            )
-            temp_neg = self.rng.permutation(
-                np.append(temp_neg, self.rng.choice(temp_neg, max_len - num_neg))
-            )
-
-            pos_ind.extend(temp_pos.tolist())
-            neg_ind.extend(temp_neg.tolist())
-            len_list.append(max_len)
-
-        return np.array(news_list), np.stack(
-            [
-                np.array(pos_ind, dtype=np.int32),
-                np.array(neg_ind, dtype=np.int32),
-                np.concatenate(
-                    [[i] * n for i, n in enumerate(len_list)], dtype=np.int32
-                ),
-            ]
-        )
-
     def __len__(self):
         return self.final_array.shape[1]
+
+    @abstractmethod
+    def __getitem__(self, idx): ...
+
+    @staticmethod
+    @abstractmethod
+    def collate_fn(input, tokenizer, news_text_max_len, history_max_len): ...
+
+
+class TextTrainDataset(AbstractTextTrainDataset):
+    def __init__(
+        self,
+        data_dir: Path,
+        news_dataset: NewsDataset,
+        batch_size: int,
+        rng=np.random.default_rng(1234),
+    ):
+        super().__init__(
+            data_dir,
+            news_dataset,
+            batch_size,
+            include_history=True,
+            data_subset=DataSubset.WITH_HISTORY,
+            rng=rng,
+        )
 
     def __getitem__(self, idx):
         return (
@@ -162,11 +172,79 @@ class TextTrainDataset(Dataset):
             self.news_text_dict[str(self.news_list[self.final_array[1, idx]])],
         )
 
+    @staticmethod
+    def collate_fn(input, tokenizer, news_text_max_len, history_max_len):
+        history_text, news_text_pos, news_text_neg = zip(*input)
+        history_unique, history_rev_index = np.unique(history_text, return_inverse=True)
+        all_news = np.concatenate((news_text_pos, news_text_neg))
+        news_unique, news_rev_index = np.unique(all_news, return_inverse=True)
+        return (
+            tokenizer(
+                history_unique.tolist(),
+                max_length=history_max_len,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ),
+            torch.tensor(history_rev_index, dtype=torch.int32),
+            tokenizer(
+                news_unique.tolist(),
+                max_length=news_text_max_len,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ),
+            torch.tensor(news_rev_index, dtype=torch.int32),
+        )
+
 
 def process_history(news_text_dict: dict[str, str], history: str):
     return EMBEDDING_SYSTEM_PROMPT + "\n".join(
         [f"{i+1}. {news_text_dict[x]}" for i, x in enumerate(history.split()[::-1])]
     )
+
+
+class TextTrainSequenceClassification(AbstractTextTrainDataset):
+    def __init__(
+        self,
+        data_dir: Path,
+        news_dataset: NewsDataset,
+        batch_size: int,
+        data_subset: DataSubset,
+        rng=np.random.default_rng(1234),
+    ):
+        super().__init__(
+            data_dir,
+            news_dataset,
+            batch_size,
+            include_history=False,
+            data_subset=data_subset,
+            rng=rng,
+        )
+
+    def __getitem__(self, idx):
+        return (
+            NEWS_CLASSIFICATION_PROMPT
+            + self.news_text_dict[str(self.news_list[self.final_array[0, idx]])],
+            NEWS_CLASSIFICATION_PROMPT
+            + self.news_text_dict[str(self.news_list[self.final_array[1, idx]])],
+        )
+
+    @staticmethod
+    def collate_fn(input, tokenizer, news_text_max_len, history_max_len=0):
+        news_text_pos, news_text_neg = zip(*input)
+        all_news = np.concatenate((news_text_pos, news_text_neg))
+        news_unique, news_rev_index = np.unique(all_news, return_inverse=True)
+        return (
+            tokenizer(
+                news_unique.tolist(),
+                max_length=news_text_max_len,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ),
+            torch.tensor(news_rev_index, dtype=torch.int32),
+        )
 
 
 def load_dataset(

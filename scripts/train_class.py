@@ -8,19 +8,28 @@ import logging
 from news_rec_utils.config import (
     NewsDataset,
     DEVICE,
-    HISTORY_TEXT_MAXLEN,
     NEWS_TEXT_MAXLEN,
     MODEL_PATH,
     DataSubset,
+    NUM_WORKERS,
+    TORCH_DTYPE,
 )
-from news_rec_utils.batch_size_finder import get_text_train_batch_size
-from news_rec_utils.modelling import get_model_and_tokenizer, output_pool
-from news_rec_utils.prepare_data import TextTrainDataset, load_dataset
-from news_rec_utils.evaluate import evaluate_df
+from news_rec_utils.batch_size_finder import get_text_inference_batch_size
+from news_rec_utils.batch_size_finder import get_text_train_class_batch_size
+from news_rec_utils.modelling import get_sequence_classification_model
+from news_rec_utils.prepare_data import (
+    TextTrainSequenceClassification,
+    load_dataset,
+    eval_collate_fn,
+    NewsTextDataset,
+    split_impressions,
+)
+from news_rec_utils.evaluate import score
 import pandas as pd
 from torch.profiler import profile, ProfilerActivity, schedule
 from contextlib import nullcontext
 import os
+from scipy.stats import rankdata
 from typing import Optional
 from pathlib import Path
 import numpy as np
@@ -47,11 +56,63 @@ def eval_model_subset(
     batch: int,
 ):
     behaviors, news_text_dict = load_dataset(
-        data_dir, news_dataset, num_samples, DataSubset.WITH_HISTORY, random_state
+        data_dir, news_dataset, num_samples, DataSubset.WITHOUT_HISTORY, random_state
     )
-    score_dict = evaluate_df(
-        behaviors, news_text_dict, output_dir=None, model=model, tokenizer=tokenizer
+    news_list, split_array, imp_counts, labels = split_impressions(
+        behaviors["Impressions"]
     )
+    model.eval()
+    news_text_batch_size = get_text_inference_batch_size(model, NEWS_TEXT_MAXLEN)
+
+    print(f"News text batch size: {news_text_batch_size}")
+    news_text_dataset = NewsTextDataset(news_list, news_text_dict)
+    news_collate_fn = partial(
+        eval_collate_fn, tokenizer=tokenizer, max_len=NEWS_TEXT_MAXLEN
+    )
+    news_dataloader = DataLoader(
+        news_text_dataset,
+        batch_size=news_text_batch_size,
+        collate_fn=news_collate_fn,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=NUM_WORKERS,
+    )
+    text_embed_list = []
+    cast_context = (
+        torch.autocast(device_type="cuda", dtype=TORCH_DTYPE)
+        if model.device.type == "cuda"
+        else nullcontext()
+    )
+    with torch.no_grad(), cast_context:
+        for inputs in tqdm(news_dataloader, desc="Embedding Text"):
+            text_embed_list.append(
+                model(**inputs.to(DEVICE)).logits.squeeze().detach().cpu()
+            )
+
+    news_embeds = torch.concatenate(text_embed_list)
+    result_list = []
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
+
+    for i in range(len(imp_counts)):
+        result_list.append(
+            rankdata(
+                -news_embeds[
+                    split_array[0, cumsum_lengths[i] : cumsum_lengths[i + 1]],
+                ],
+                method="dense",
+            ).tolist()
+        )
+    score_dict = score(
+        np.array(
+            result_list,
+            dtype=object,
+        ),
+        labels,
+    )
+
+    # score_dict = evaluate_df(
+    #     behaviors, news_text_dict, output_dir=None, model=model, tokenizer=tokenizer
+    # )
     final_dict = {"epoch": epoch, "batch": batch, "scores": score_dict}
     with open("./eval_score.jsonl", "a") as f:
         f.write(json.dumps(final_dict) + "\n")
@@ -65,7 +126,6 @@ class TextModelTrainer:
         val_news_dataset: NewsDataset,
         num_val: int,
         model_path,
-        history_max_len=HISTORY_TEXT_MAXLEN,
         news_text_max_len=NEWS_TEXT_MAXLEN,
         device=DEVICE,
         ckpt_steps=50,
@@ -77,29 +137,31 @@ class TextModelTrainer:
         self.data_dir = data_dir
         self.val_news_dataset = val_news_dataset
         self.num_val = num_val
-        self.model, self.tokenizer = get_model_and_tokenizer(
-            model_path, peft_model=True, device=device
+        self.model, self.tokenizer = get_sequence_classification_model(
+            model_path, device=device
         )
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-5)
-        self.loss_fn = torch.nn.TripletMarginWithDistanceLoss(
-            distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y), margin=0.7
-        )
-        self.pool_fn = output_pool(self.model)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-3)
 
-        batch_size = get_text_train_batch_size(
-            self.model, self.optimizer, history_max_len, news_text_max_len
+        self.loss_fn = torch.nn.MarginRankingLoss(margin=10)
+
+        batch_size = get_text_train_class_batch_size(
+            self.model, self.optimizer, news_text_max_len
         )
         print(f"Batch size: {batch_size}")
 
         partial_collate = partial(
-            TextTrainDataset.collate_fn,
+            TextTrainSequenceClassification.collate_fn,
             tokenizer=self.tokenizer,
-            history_max_len=history_max_len,
             news_text_max_len=news_text_max_len,
+            history_max_len=0,
         )
 
-        train_dataset = TextTrainDataset(
-            data_dir, train_news_dataset, batch_size, rng=self.rng
+        train_dataset = TextTrainSequenceClassification(
+            data_dir,
+            train_news_dataset,
+            batch_size,
+            data_subset=DataSubset.ALL,
+            rng=self.rng,
         )
         self.train_dataloader = DataLoader(
             train_dataset,
@@ -131,26 +193,20 @@ class TextModelTrainer:
                 self.scaler = torch.amp.GradScaler(device.type)
 
     def train_one_batch(self, inputs):
-        history_text_tokenized, history_index, news_text_tokenized, news_index = inputs
+        news_text_tokenized, news_index = inputs
         self.model.train()
         self.optimizer.zero_grad()
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.cast_dtype,
         ):
-            history_text_embed = self.pool_fn(
-                self.model(**history_text_tokenized.to(self.device)).last_hidden_state,
-                history_text_tokenized["attention_mask"],
-            )
-
-            news_text_embed = self.pool_fn(
-                self.model(**news_text_tokenized.to(self.device)).last_hidden_state,
-                news_text_tokenized["attention_mask"],
-            )
+            news_text_embed = self.model(
+                **news_text_tokenized.to(self.device)
+            ).logits.squeeze()
 
             loss = self.loss_fn(
-                history_text_embed[history_index.to(self.device)],
                 *torch.chunk(news_text_embed[news_index.to(self.device)], 2),
+                torch.tensor([1], device=self.device, dtype=torch.int32),
             )
 
         if self.scaler:

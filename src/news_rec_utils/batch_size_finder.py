@@ -27,6 +27,21 @@ def dummy_train_func(model, optimizer, dummy_func, max_len, batch_size):
     optimizer.zero_grad()
 
 
+def dummy_text_train_class_func(model, optimizer, dummy_func, max_len, batch_size):
+    optimizer.zero_grad()
+    with torch.autocast("cuda", torch.float16):
+        (
+            model(
+                **dummy_func(
+                    max_len=max_len,
+                    batch_size=batch_size,
+                    device=model.device,
+                )["inputs"]
+            ).logits.min()
+        ).backward()
+    optimizer.zero_grad()
+
+
 def dummy_text_train_func(
     model, optimizer, dummy_func, history_max_len, news_text_max_len, batch_size
 ):
@@ -97,6 +112,28 @@ def get_batch_size(test_func):
         else:
             high = mid
     return low
+
+
+def get_text_train_class_batch_size(model, optimizer, max_len):
+    if model.device.type != "cuda":
+        print("Model is on CPU. Not CUDA. Returning batch size of 5")
+        return 5
+    model_part = str(model.config if hasattr(model, "config") else model)
+    optimizer_part = str(type(optimizer))
+    task_type = "TEXT_TRAINING"
+    max_len_key = str(max_len)
+    key = model_part + optimizer_part + task_type + max_len_key
+    if key not in BATCH_SIZES:
+        BATCH_SIZES[key] = get_batch_size(
+            partial(
+                dummy_text_train_class_func,
+                model,
+                optimizer,
+                dummy_text_inputs_outputs,
+                max_len,
+            )
+        )
+    return BATCH_SIZES[key]
 
 
 def get_text_train_batch_size(model, optimizer, history_max_len, news_text_max_len):
