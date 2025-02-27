@@ -1,8 +1,9 @@
 import torch
 import gc
 from functools import partial
-from .modelling import dummy_head_inputs_outputs, dummy_text_inputs_outputs
+from .dummy import dummy_head_inputs_outputs, dummy_text_inputs_outputs
 
+# Add reference to pytorch lightning
 # Keys are ModelConfig_str(optimizer_type)_task_max_len. Value is batch size
 BATCH_SIZES = dict()
 

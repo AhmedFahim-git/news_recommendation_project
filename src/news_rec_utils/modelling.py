@@ -5,49 +5,24 @@ from transformers import (
     AutoModelForSequenceClassification,
 )
 import torch
-from .config import DEVICE, EMBEDDING_DIM, TORCH_DTYPE, HEAD_MAX_BATCH_SIZE, LORA_CONFIG
+import torch.nn.functional as F
+from .config import (
+    DEVICE,
+    EMBEDDING_DIM,
+    HEAD_MAX_BATCH_SIZE,
+    LORA_CONFIG,
+)
 from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
     BaseModelOutputWithPast,
 )
-from tqdm import tqdm
-from contextlib import nullcontext
 from collections.abc import Callable
 import numpy as np
 from peft.mapping import get_peft_model
+from typing import Optional
+from pathlib import Path
 
 # path = "Alibaba-NLP/gte-base-en-v1.5"
-
-
-def dummy_text_inputs_outputs(batch_size: int, max_len: int, device=DEVICE):
-    return {
-        "inputs": {
-            "input_ids": torch.ones((batch_size, max_len), dtype=torch.int).to(device),
-            "attention_mask": torch.ones((batch_size, max_len), dtype=torch.int).to(
-                device
-            ),
-            "token_type_ids": torch.zeros((batch_size, max_len), dtype=torch.int).to(
-                device
-            ),
-        },
-        "outputs": torch.ones((batch_size,), dtype=torch.float32, device=device),
-    }
-
-
-def dummy_head_inputs_outputs(
-    batch_size: int, max_len: int, embedding_dim: int = EMBEDDING_DIM, device=DEVICE
-):
-    return {
-        "inputs": {
-            "embeddings": torch.rand((batch_size, max_len, embedding_dim)).to(device),
-            "attention_mask": torch.ones((batch_size, max_len), dtype=torch.int32).to(
-                device
-            ),
-        },
-        "outputs": torch.ones(
-            (batch_size * max_len,), dtype=torch.float32, device=device
-        ),
-    }
 
 
 @torch.compile
@@ -65,7 +40,7 @@ def last_token_pool(
         ]
 
 
-def output_pool(model) -> Callable[[torch.Tensor, ...], torch.Tensor]:
+def output_pool(model) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     def get_last_embedding(
         last_hidden_states: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
@@ -75,6 +50,8 @@ def output_pool(model) -> Callable[[torch.Tensor, ...], torch.Tensor]:
         return last_token_pool
     elif model.config.architectures[0] == "NewModel":
         return get_last_embedding
+    else:
+        return lambda x, y: x
     # Alternate implementation
     # with torch.no_grad():
     #     output = model(**dummy_text_inputs(1, 1, device=model.device)).to("cpu")
@@ -82,6 +59,28 @@ def output_pool(model) -> Callable[[torch.Tensor, ...], torch.Tensor]:
     #     return last_token_pool
     # elif isinstance(output, BaseModelOutputWithPooling):
     #     return get_last_embedding
+
+
+class ClassificationHead(torch.nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+        super().__init__()
+        self.linear_1 = torch.nn.Linear(in_features=in_dim, out_features=hidden_dim)
+        self.linear_2 = torch.nn.Linear(in_features=hidden_dim, out_features=hidden_dim)
+        self.linear_3 = torch.nn.Linear(in_features=hidden_dim, out_features=out_dim)
+
+    def forward(self, x):
+        x = F.relu(self.linear_1(x))
+        x = F.relu(self.linear_2(x))
+        return F.tanh(self.linear_3(x))
+
+
+def get_classification_head(model_path: Optional[Path] = None):
+    model = ClassificationHead(
+        in_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, out_dim=1
+    )
+    if model_path:
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+    return model.to(DEVICE)
 
 
 # As a final task please add an attention layer on top of the news embeddings to get modified embeddings that takes all news into account
@@ -127,27 +126,21 @@ def get_sequence_classification_model(path, device=DEVICE):
     return model, tokenizer
 
 
-# To do. Try replacing with dataloader
-def get_text_embed_eval(model, input_dataloader):
-    device = model.device
-    pool_fn = output_pool(model)
-    text_embed_list = []
-    cast_context = (
-        torch.autocast(device_type="cuda", dtype=TORCH_DTYPE)
-        if model.device.type == "cuda"
-        else nullcontext()
-    )
-    with torch.no_grad(), cast_context:
-        for inputs in tqdm(input_dataloader, desc="Embedding Text"):
-            text_embed_list.append(
-                pool_fn(
-                    model(**inputs.to(device)).last_hidden_state,
-                    inputs["attention_mask"],
-                )
-                .detach()
-                .cpu()
-            )
-    return torch.concatenate(text_embed_list)
+class WeightedSumModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.alpha = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, cos_sim, baseline):
+        alpha = torch.sigmoid(self.alpha)
+        return cos_sim * alpha + baseline * (1 - alpha)
+
+
+def get_weighted_sum_model(model_path: Optional[Path] = None):
+    model = WeightedSumModel()
+    if model_path:
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+    return model.to(DEVICE)
 
 
 def get_head_model(path: str, device=DEVICE):

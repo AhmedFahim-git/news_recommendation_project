@@ -70,6 +70,10 @@ LORA_CONFIG = ModifiedLoraConfig(
     enable_lora=[True, False, True],
 )
 
+CLASSIFICATION_MODEL_BATCH_SIZE = 1024
+
+torch.manual_seed(1234)
+torch.cuda.manual_seed_all(1234)
 # EMPTY_USER_PROMPT = (
 #     "Given that the user hasn't read any news yet what news to recommend"
 # )

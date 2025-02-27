@@ -4,6 +4,8 @@ from .config import (
     EMBEDDING_SYSTEM_PROMPT,
     DataSubset,
     NEWS_CLASSIFICATION_PROMPT,
+    NEWS_TEXT_MAXLEN,
+    HISTORY_TEXT_MAXLEN,
 )
 from pathlib import Path
 import argparse
@@ -13,68 +15,24 @@ import numpy as np
 from torch.utils.data import Dataset
 import torch
 from abc import ABC, abstractmethod
+from typing import Callable
 
 
-def eval_collate_fn(input, tokenizer, max_len):
-    return tokenizer(
-        input,
-        max_length=max_len,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-
-class HistoryDataset(Dataset):
-    def __init__(self, history_list, news_text_dict: dict[str, str]):
-        self.history_list = history_list
-        self.news_text_dict = news_text_dict
-
-    def __len__(self):
-        return len(self.history_list)
-
-    def __getitem__(self, idx):
-        return process_history(self.news_text_dict, self.history_list[idx])
-
-
-class NewsTextDataset(Dataset):
-    def __init__(self, news_list, news_text_dict: dict[str, str]):
-        self.news_list = news_list
-        self.news_text_dict = news_text_dict
-
-    def __len__(self):
-        return len(self.news_list)
-
-    def __getitem__(self, idx):
-        return self.news_text_dict[self.news_list[idx]]
-
-
-def _split_impressions_train(
-    rng: np.random.Generator, impressions
-) -> tuple[np.ndarray, np.ndarray]:
-    cur = 0
-    pos_dict = dict()
-    len_list = []
-    news_list = []
-    pos_ind = []
-    neg_ind = []
-    for row in tqdm(impressions, desc="Splitting impressions"):
+def split_impressions_pos_neg(
+    rng: np.random.Generator, grouped_news_rev_index: np.ndarray, labels: np.ndarray
+):
+    pos_ind, neg_ind, len_list = [], [], []
+    for i, row in enumerate(labels):
         temp_pos, temp_neg = [], []
-        news, label = zip(
-            *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
-        )
-        num_pos = sum(label)
-        num_neg = len(label) - num_pos
-        max_len = max(num_neg, num_pos)
-        for i in range(len(label)):
-            if news[i] not in pos_dict:
-                pos_dict[news[i]] = cur
-                cur += 1
-                news_list.append(news[i])
-            if label[i] == 0:
-                temp_neg.append(pos_dict[news[i]])
+        num_pos = sum(row)
+        num_neg = len(row) - num_pos
+        max_len = max(num_pos, num_neg)
+        for j, label in enumerate(row):
+            news_rev_ind = grouped_news_rev_index[i][j]
+            if label == 0:
+                temp_neg.append(news_rev_ind)
             else:
-                temp_pos.append(pos_dict[news[i]])
+                temp_pos.append(news_rev_ind)
         temp_pos = rng.permutation(
             np.append(temp_pos, rng.choice(temp_pos, max_len - num_pos))
         )
@@ -85,14 +43,59 @@ def _split_impressions_train(
         pos_ind.extend(temp_pos.tolist())
         neg_ind.extend(temp_neg.tolist())
         len_list.append(max_len)
-
-    return np.array(news_list), np.stack(
+    return np.stack(
         [
             np.array(pos_ind, dtype=np.int32),
             np.array(neg_ind, dtype=np.int32),
             np.concatenate([[i] * n for i, n in enumerate(len_list)], dtype=np.int32),
         ]
     )
+
+
+# def split_impressions_pos_neg(
+#     rng: np.random.Generator, impressions
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     cur = 0
+#     pos_dict = dict()
+#     len_list = []
+#     news_list = []
+#     pos_ind = []
+#     neg_ind = []
+#     for row in tqdm(impressions, desc="Splitting impressions"):
+#         temp_pos, temp_neg = [], []
+#         news, label = zip(
+#             *map(lambda x: (x[0], int(x[1])), [k.split("-") for k in row.split()])
+#         )
+#         num_pos = sum(label)
+#         num_neg = len(label) - num_pos
+#         max_len = max(num_neg, num_pos)
+#         for i in range(len(label)):
+#             if news[i] not in pos_dict:
+#                 pos_dict[news[i]] = cur
+#                 cur += 1
+#                 news_list.append(news[i])
+#             if label[i] == 0:
+#                 temp_neg.append(pos_dict[news[i]])
+#             else:
+#                 temp_pos.append(pos_dict[news[i]])
+#         temp_pos = rng.permutation(
+#             np.append(temp_pos, rng.choice(temp_pos, max_len - num_pos))
+#         )
+#         temp_neg = rng.permutation(
+#             np.append(temp_neg, rng.choice(temp_neg, max_len - num_neg))
+#         )
+
+#         pos_ind.extend(temp_pos.tolist())
+#         neg_ind.extend(temp_neg.tolist())
+#         len_list.append(max_len)
+
+#     return np.array(news_list), np.stack(
+#         [
+#             np.array(pos_ind, dtype=np.int32),
+#             np.array(neg_ind, dtype=np.int32),
+#             np.concatenate([[i] * n for i, n in enumerate(len_list)], dtype=np.int32),
+#         ]
+#     )
 
 
 class AbstractTextTrainDataset(Dataset, ABC):
@@ -116,7 +119,7 @@ class AbstractTextTrainDataset(Dataset, ABC):
         if include_history:
             self.history = behaviors["History"].values
 
-        self.news_list, self.final_array = _split_impressions_train(
+        self.news_list, self.final_array = split_impressions_pos_neg(
             self.rng, behaviors["Impressions"]
         )
 
@@ -152,6 +155,7 @@ class TextTrainDataset(AbstractTextTrainDataset):
         data_dir: Path,
         news_dataset: NewsDataset,
         batch_size: int,
+        baseline_dict: dict[str, float],
         rng=np.random.default_rng(1234),
     ):
         super().__init__(
@@ -162,6 +166,7 @@ class TextTrainDataset(AbstractTextTrainDataset):
             data_subset=DataSubset.WITH_HISTORY,
             rng=rng,
         )
+        self.baseline_dict = baseline_dict
 
     def __getitem__(self, idx):
         return (
@@ -170,11 +175,13 @@ class TextTrainDataset(AbstractTextTrainDataset):
             ),
             self.news_text_dict[str(self.news_list[self.final_array[0, idx]])],
             self.news_text_dict[str(self.news_list[self.final_array[1, idx]])],
+            self.baseline_dict[str(self.news_list[self.final_array[0, idx]])],
+            self.baseline_dict[str(self.news_list[self.final_array[1, idx]])],
         )
 
     @staticmethod
     def collate_fn(input, tokenizer, news_text_max_len, history_max_len):
-        history_text, news_text_pos, news_text_neg = zip(*input)
+        history_text, news_text_pos, news_text_neg, pos_base, neg_base = zip(*input)
         history_unique, history_rev_index = np.unique(history_text, return_inverse=True)
         all_news = np.concatenate((news_text_pos, news_text_neg))
         news_unique, news_rev_index = np.unique(all_news, return_inverse=True)
@@ -195,6 +202,8 @@ class TextTrainDataset(AbstractTextTrainDataset):
                 return_tensors="pt",
             ),
             torch.tensor(news_rev_index, dtype=torch.int32),
+            torch.tensor(pos_base, dtype=torch.float32),
+            torch.tensor(neg_base, dtype=torch.float32),
         )
 
 
@@ -247,6 +256,28 @@ class TextTrainSequenceClassification(AbstractTextTrainDataset):
         )
 
 
+def expand_items(items: np.ndarray, rev_index: np.ndarray, imp_counts: np.ndarray):
+    result_list = []
+
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
+    for i in range(len(imp_counts)):
+        result_list.append(items[rev_index[cumsum_lengths[i] : cumsum_lengths[i + 1]]])
+    return np.concatenate(result_list)
+
+
+def group_items(
+    items: np.ndarray,
+    imp_counts: np.ndarray,
+    func: Callable[[np.ndarray], np.ndarray] = lambda x: x,
+):
+    result_list = []
+
+    cumsum_lengths = np.concatenate([[0], imp_counts.cumsum()])
+    for i in range(len(imp_counts)):
+        result_list.append(func(items[cumsum_lengths[i] : cumsum_lengths[i + 1]]))
+    return np.array(result_list, dtype=object)
+
+
 def load_dataset(
     data_dir: Path,
     news_dataset: NewsDataset,
@@ -254,6 +285,7 @@ def load_dataset(
     data_subset: Optional[DataSubset] = DataSubset.ALL,
     random_state: int | np.random.Generator = 1234,
 ):
+    num_samples = 200
     behaviors = pd.read_parquet(
         data_dir / "processed" / news_dataset.value / "behaviors.parquet",
         columns=["ImpressionID", "History", "Impressions"],
