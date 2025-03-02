@@ -111,8 +111,12 @@ class ClassificationModelTrainer:
         self.train_news_data.rank_group_preds()
         self.val_news_data.rank_group_preds()
 
-        train_eval_score = self.train_news_data.get_scores_dict()
-        val_eval_score = self.val_news_data.get_scores_dict()
+        train_eval_score = self.train_news_data.get_scores_dict(
+            data_subset=DataSubset.WITHOUT_HISTORY
+        )
+        val_eval_score = self.val_news_data.get_scores_dict(
+            data_subset=DataSubset.WITHOUT_HISTORY
+        )
 
         print(
             epoch + 1,
