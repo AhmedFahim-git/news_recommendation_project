@@ -22,6 +22,7 @@ from typing import Optional
 from pathlib import Path
 from abc import ABC, abstractmethod
 import torch
+from copy import copy
 
 
 class AbstractTextDataset(Dataset, ABC):
@@ -103,6 +104,8 @@ class NewsData:
             )
         self.news_text_dict = news_text_dict
         self.impression_ids = behaviors["ImpressionID"]
+        self.impressions = behaviors["Impressions"]
+        self.history = behaviors["History"]
         self.news_list, split_array, self.imp_counts, self.labels = split_impressions(
             behaviors["Impressions"]
         )
@@ -111,19 +114,198 @@ class NewsData:
         self.has_without_history = behaviors["History"].isna().any()
         self.history_bool = behaviors["History"].notna()
         self.history_bool_extended = behaviors["History"].notna()[split_array[1]]
+        self.history_list, self.history_rev_index = np.array([]), np.array([])
         if self.has_history:
             self.history_list, self.history_rev_index = np.unique(
                 behaviors[self.history_bool]["History"], return_inverse=True
             )
-            self.news_rev_index_history = split_array[0, self.history_bool_extended]
-            self.news_rev_index_no_history = split_array[0, ~self.history_bool_extended]
-            self.history_embeds = torch.tensor([])
-            self.cos_sim_scores = np.array([])
+        self.news_rev_index_history = split_array[0, self.history_bool_extended]
+        self.news_rev_index_no_history = split_array[0, ~self.history_bool_extended]
+        self.history_embeds = torch.tensor([])
+        self.cos_sim_scores = np.array([])
         self.news_embeds = torch.tensor([])
         self.news_embeds_original = torch.tensor([])
         self.baseline_scores = np.array([])
         self.pred_scores = np.array([])
         self.grouped_ranked_preds = np.array([], dtype=object)
+
+    def get_subset(
+        self,
+        num_samples: Optional[int] = None,
+        data_subset: Optional[DataSubset] = DataSubset.ALL,
+        rng: Optional[np.random.Generator] = None,
+    ):
+        def filter_subset(variable: torch.Tensor | np.ndarray, filter):
+            return variable if len(variable) == 0 else variable[filter]
+
+        new_news = copy(self)
+        indices_use = np.arange(len(self.impression_ids))
+        if data_subset == DataSubset.WITH_HISTORY:
+            assert (
+                new_news.has_history
+            ), "If we want histroy subset. History must be present"
+            indices_use = indices_use[self.history_bool]
+            # new_news.has_without_history = False
+            # new_news.baseline_scores = filter_subset(
+            #     new_news.baseline_scores, new_news.history_bool_extended
+            # )
+            # new_news.pred_scores = filter_subset(
+            #     new_news.pred_scores, new_news.history_bool_extended
+            # )
+            # new_news.grouped_ranked_preds = filter_subset(
+            #     new_news.grouped_ranked_preds, new_news.history_bool
+            # )
+            # new_news.impression_ids = new_news.impression_ids.loc[
+            #     new_news.history_bool
+            # ].reset_index(drop=True)
+            # new_news.impressions = new_news.impressions.loc[
+            #     new_news.history_bool
+            # ].reset_index(drop=True)
+            # new_news.history = new_news.history.loc[new_news.history_bool].reset_index(
+            #     drop=True
+            # )
+            # new_news.news_list, split_array, new_news.imp_counts, new_news.labels = (
+            #     split_impressions(new_news.impressions)
+            # )
+            # new_news.news_rev_index = split_array[0]
+            # new_news.history_bool = new_news.history.notna()
+            # new_news.history_bool_extended = new_news.history.notna()[split_array[1]]
+            # indices = np.isin(self.news_list, new_news.news_list, assume_unique=True)
+            # new_news.news_embeds = new_news.news_embeds[indices]
+            # new_news.news_embeds_original = new_news.news_embeds[indices]
+            # new_news.history_list, new_news.history_rev_index = np.unique(
+            #     new_news.history[new_news.history_bool], return_inverse=True
+            # )
+            # new_news.news_rev_index_history = split_array[
+            #     0, new_news.history_bool_extended
+            # ]
+            # new_news.news_rev_index_no_history = split_array[
+            #     0, ~new_news.history_bool_extended
+            # ]
+        elif data_subset == DataSubset.WITHOUT_HISTORY:
+            assert (
+                new_news.has_without_history
+            ), "If we want without histroy subset. Without history must be present"
+            indices_use = indices_use[~self.history_bool]
+            # new_news.has_history = False
+            # new_news.baseline_scores = filter_subset(
+            #     new_news.baseline_scores, ~new_news.history_bool_extended
+            # )
+            # new_news.pred_scores = filter_subset(
+            #     new_news.pred_scores, ~new_news.history_bool_extended
+            # )
+            # new_news.grouped_ranked_preds = filter_subset(
+            #     new_news.grouped_ranked_preds, ~new_news.history_bool
+            # )
+            # new_news.impression_ids = new_news.impression_ids.loc[
+            #     ~new_news.history_bool
+            # ].reset_index(drop=True)
+            # new_news.impressions = new_news.impressions.loc[
+            #     ~new_news.history_bool
+            # ].reset_index(drop=True)
+            # new_news.history = new_news.history.loc[~new_news.history_bool].reset_index(
+            #     drop=True
+            # )
+            # new_news.news_list, split_array, new_news.imp_counts, new_news.labels = (
+            #     split_impressions(new_news.impressions)
+            # )
+            # new_news.news_rev_index = split_array[0]
+            # new_news.history_bool = new_news.history.notna()
+            # new_news.history_bool_extended = new_news.history.notna()[split_array[1]]
+            # indices = np.isin(self.news_list, new_news.news_list, assume_unique=True)
+            # new_news.news_embeds = new_news.news_embeds[indices]
+            # new_news.news_embeds_original = new_news.news_embeds[indices]
+            # new_news.history_list, new_news.history_rev_index = np.unique(
+            #     new_news.history[new_news.history_bool], return_inverse=True
+            # )
+            # new_news.news_rev_index_history = split_array[
+            #     0, new_news.history_bool_extended
+            # ]
+            # new_news.news_rev_index_no_history = split_array[
+            #     0, ~new_news.history_bool_extended
+            # ]
+
+        if num_samples:
+            assert num_samples <= len(
+                indices_use
+            ), "Cannot use more numbers than we have"
+            if rng:
+                main_indices = rng.choice(indices_use, size=num_samples, replace=False)
+                main_indices.sort()
+            else:
+                main_indices = indices_use[:num_samples]
+            new_news.impression_ids = new_news.impression_ids.iloc[
+                main_indices
+            ].reset_index(drop=True)
+            new_news.impressions = new_news.impressions.iloc[main_indices].reset_index(
+                drop=True
+            )
+            new_news.history = new_news.history.iloc[main_indices].reset_index(
+                drop=True
+            )
+            new_news.news_list, split_array, new_news.imp_counts, new_news.labels = (
+                split_impressions(new_news.impressions)
+            )
+            new_news.news_rev_index = split_array[0]
+            new_news.has_history = new_news.history.notna().any()
+            new_news.has_without_history = new_news.history.isna().any()
+            new_news.history_bool = new_news.history.notna()
+            new_news.history_bool_extended = new_news.history.notna()[split_array[1]]
+            new_news.history_list, new_news.history_rev_index = np.array([]), np.array(
+                []
+            )
+            if new_news.has_history:
+                new_news.history_list, new_news.history_rev_index = np.unique(
+                    new_news.history[new_news.history_bool], return_inverse=True
+                )
+            new_news.news_rev_index_history = split_array[
+                0, new_news.history_bool_extended
+            ]
+            new_news.news_rev_index_no_history = split_array[
+                0, ~new_news.history_bool_extended
+            ]
+            news_indices = np.isin(
+                self.news_list, new_news.news_list, assume_unique=True
+            )
+            history_indices = np.isin(
+                self.history_list, new_news.history_list, assume_unique=True
+            )
+            overall_filter = np.isin(
+                np.repeat(np.arange(len(self.impression_ids)), self.imp_counts),
+                main_indices,
+                kind="table",
+            )
+            new_news.history_embeds = filter_subset(
+                new_news.history_embeds, history_indices
+            )
+            new_news.news_embeds = filter_subset(new_news.news_embeds, news_indices)
+            new_news.news_embeds_original = filter_subset(
+                new_news.news_embeds_original, news_indices
+            )
+            new_news.baseline_scores = filter_subset(
+                new_news.baseline_scores, news_indices
+            )
+            new_news.cos_sim_scores = filter_subset(
+                new_news.cos_sim_scores, overall_filter[self.history_bool_extended]
+            )
+            new_news.pred_scores = filter_subset(new_news.pred_scores, overall_filter)
+            new_news.grouped_ranked_preds = filter_subset(
+                new_news.grouped_ranked_preds, main_indices
+            )
+            # if (len(new_news.history_embeds) > 0) and (len(new_news.news_embeds) > 0):
+            #     new_news.cos_sim_scores = new_news.get_cos_sim_scores()
+            #     new_news.get_final_score()
+
+            # new_news.pred_scores = new_news.pred_scores[np.arange(len(self.impression_ids))]
+            # new_news.cos_sim_scores = filter_subset(
+            #     new_news.cos_sim_scores, new_news.history_bool_extended
+            # )
+            # self.news_embeds = torch.tensor([])
+            # self.news_embeds_original = torch.tensor([])
+            # self.baseline_scores = np.array([])
+            # self.pred_scores = np.array([])
+            # self.grouped_ranked_preds = np.array([], dtype=object)
+        return new_news
 
     def get_all_embeds(
         self, *, model=None, tokenizer=None, model_path: Optional[str] = None
@@ -179,16 +361,16 @@ class NewsData:
         classification_model_path: Optional[Path] = None,
     ):
         assert len(self.news_embeds_original) > 0, "News Embeddings must be available"
-        self.baseline_scores = expand_items(
-            get_classification_model_eval(
-                self.news_embeds_original,
-                classification_model,
-                classification_model_path,
-            ),
-            self.news_rev_index,
-            self.imp_counts,
+        self.baseline_scores = get_classification_model_eval(
+            self.news_embeds_original,
+            classification_model,
+            classification_model_path,
         )
-        self.pred_scores = self.baseline_scores
+        self.pred_scores = self.expand_baseline_scores()
+
+    def expand_baseline_scores(self):
+        assert len(self.baseline_scores) > 0, "Baseline Scores must be available"
+        return expand_items(self.baseline_scores, self.news_rev_index, self.imp_counts)
 
     def get_cos_sim_scores(self):
         assert self.has_history, "History should be available in order to use this"
@@ -205,17 +387,15 @@ class NewsData:
     def get_final_score(
         self,
         *,
-        alpha: Optional[float] = None,
         model: Optional[WeightedSumModel] = None,
         model_path: Optional[Path] = None,
     ):
         assert self.has_history, "History should be available in order to use this"
         assert len(self.cos_sim_scores) > 0, "Cos Sim scores must be available"
         assert len(self.baseline_scores) > 0, "Baseline scores must be available"
-        self.pred_scores[self.news_rev_index_history] = get_weighted_model_eval(
+        self.pred_scores[self.history_bool_extended] = get_weighted_model_eval(
             self.cos_sim_scores,
-            self.baseline_scores[self.news_rev_index_history],
-            alpha=alpha,
+            self.expand_baseline_scores()[self.history_bool_extended],
             model=model,
             model_path=model_path,
         )
@@ -228,7 +408,9 @@ class NewsData:
             func=lambda x: rankdata(-x, method="dense"),
         )
 
-    def get_scores_dict(self, data_subset: DataSubset = DataSubset.ALL):
+    def get_scores_dict(
+        self, data_subset: DataSubset = DataSubset.ALL, debug_dir: Optional[Path] = None
+    ):
         from .evaluate import score
 
         assert (
@@ -241,6 +423,8 @@ class NewsData:
             return score(
                 self.grouped_ranked_preds[self.history_bool],
                 self.labels[self.history_bool],
+                imp_ids=self.impression_ids[self.history_bool].tolist(),
+                debug_dir=debug_dir,
             )
         elif data_subset == DataSubset.WITHOUT_HISTORY:
             assert (
@@ -249,9 +433,16 @@ class NewsData:
             return score(
                 self.grouped_ranked_preds[~self.history_bool],
                 self.labels[~self.history_bool],
+                imp_ids=self.impression_ids[~self.history_bool].tolist(),
+                debug_dir=debug_dir,
             )
         else:
-            return score(self.grouped_ranked_preds, self.labels)
+            return score(
+                self.grouped_ranked_preds,
+                self.labels,
+                imp_ids=self.impression_ids.tolist(),
+                debug_dir=debug_dir,
+            )
 
     def save_preds(self, output_dir: Path):
         assert (

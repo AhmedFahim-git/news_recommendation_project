@@ -19,6 +19,7 @@ from .prepare_data import (
 )
 from pathlib import Path
 from typing import Optional
+import json
 import argparse
 
 # Scoring functions adapted from https://github.com/msnews/MIND/blob/master/evaluate.py
@@ -45,7 +46,12 @@ def mrr_score(y_true, y_score):
     return np.sum(rr_score) / np.sum(y_true)
 
 
-def score(preds_input, labels_input):
+def score(
+    preds_input,
+    labels_input,
+    imp_ids: list[str] = [],
+    debug_dir: Optional[Path] = None,
+):
     aucs = []
     mrrs = []
     ndcg5s = []
@@ -77,7 +83,27 @@ def score(preds_input, labels_input):
         mrrs.append(mrr)
         ndcg5s.append(ndcg5)
         ndcg10s.append(ndcg10)
-
+    if debug_dir and (len(imp_ids) > 0):
+        try:
+            assert (
+                len(imp_ids) == preds_input
+            ), "Number of impression ids should be same as the number of preds"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "debug_json.json") as f:
+                json.dump(
+                    {
+                        "ImpressionID": imp_ids,
+                        "auc": aucs,
+                        "mrr": mrrs,
+                        "ndcg5": ndcg5s,
+                        "ndcg10": ndcg10s,
+                        "preds": preds_input,
+                        "labels": labels_input,
+                    },
+                    f,
+                )
+        except:
+            print("Debug not possible due to error")
     return {
         "auc": np.mean(aucs),
         "mrr": np.mean(mrrs),
@@ -233,9 +259,9 @@ def evaluate_df(
     tokenizer=None,
     classification_model_path: Optional[Path] = None,
     classification_model=None,
-    alpha: Optional[float] = None,
     weight_model=None,
-    weith_model_path=None,
+    weight_model_path: Optional[Path] = None,
+    debug_dir: Optional[Path] = None,
 ):
     final_score_dict = dict()
     news_data_obj = NewsData(behaviors=behaviors, news_text_dict=news_text_dict)
@@ -247,22 +273,23 @@ def evaluate_df(
         classification_model=classification_model,
         classification_model_path=classification_model_path,
     )
-    news_data_obj.get_final_score(
-        alpha=alpha, model=weight_model, model_path=weith_model_path
-    )
+    news_data_obj.get_final_score(model=weight_model, model_path=weight_model_path)
     news_data_obj.rank_group_preds()
 
     if len(news_data_obj.labels) > 0:
         if news_data_obj.has_history:
             final_score_dict["with_history_score"] = news_data_obj.get_scores_dict(
-                DataSubset.WITH_HISTORY
+                DataSubset.WITH_HISTORY,
+                debug_dir=debug_dir,
             )
         if news_data_obj.has_without_history:
             final_score_dict["without_history_score"] = news_data_obj.get_scores_dict(
-                DataSubset.WITHOUT_HISTORY
+                DataSubset.WITHOUT_HISTORY,
+                debug_dir=debug_dir,
             )
         final_score_dict["overall_score_dict"] = news_data_obj.get_scores_dict(
-            DataSubset.ALL
+            DataSubset.ALL,
+            debug_dir=debug_dir,
         )
 
     print(final_score_dict)
@@ -378,10 +405,16 @@ def main():
     )
 
     parser.add_argument(
-        "--head_model_path",
-        type=str,
-        default=HEAD_MODEL_PATH,
-        help=f"Path to the head model file (default: {HEAD_MODEL_PATH})",
+        "--classification_model_path",
+        type=Path,
+        required=True,
+        help=f"Path to the classification model file",
+    )
+    parser.add_argument(
+        "--weight_model_path",
+        type=Path,
+        required=True,
+        help=f"Path to the weight model file",
     )
 
     parser.add_argument(
@@ -397,6 +430,7 @@ def main():
         default=None,
         help="Number of samples to evaluate (default: None, meaning all samples)",
     )
+    parser.add_argument("--debug_dir", type=Path, help="Place to store the debug json")
 
     args = parser.parse_args()
 
@@ -415,5 +449,7 @@ def main():
         news_text,
         output_dir=args.output_dir,
         model_path=args.model_path,
-        classification_model_path=args.head_model_path,
+        classification_model_path=args.classification_model_path,
+        weight_model_path=args.weight_model_path,
+        debug_dir=args.debug_dir,
     )

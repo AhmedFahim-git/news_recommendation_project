@@ -126,16 +126,14 @@ def get_classification_model_eval(
 def get_weighted_model_eval(
     cos_sim: np.ndarray | torch.Tensor,
     baseline: np.ndarray | torch.Tensor,
-    alpha: Optional[float] = None,
     model: Optional[WeightedSumModel] = None,
     model_path: Optional[Path] = None,
 ):
-    if not alpha:
-        if not model:
-            model = get_weighted_sum_model(model_path)
-        with torch.no_grad():
-            alpha = torch.sigmoid(model.alpha).item()
-    return cos_sim * alpha + baseline * (1 - alpha)
+    if not model:
+        model = get_weighted_sum_model(model_path)
+    with torch.no_grad():
+        res = model(cos_sim, baseline)
+    return res
 
 
 def get_cos_sim_eval(

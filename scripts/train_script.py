@@ -1,5 +1,5 @@
 import argparse
-from news_rec_utils.config import NewsDataset, MODEL_PATH
+from news_rec_utils.config import NewsDataset, DataSubset, MODEL_PATH
 from news_rec_utils.trainer import ClassificationModelTrainer, TextModelTrainer
 from pathlib import Path
 
@@ -99,10 +99,14 @@ if __name__ == "__main__":
     trainer = TextModelTrainer(
         model_path=args.model_path,
         train_news_data=classification_trainer.train_news_data,
-        val_news_data=classification_trainer.val_news_data,
+        val_news_data=classification_trainer.val_news_data.get_subset(
+            args.num_val, data_subset=DataSubset.WITH_HISTORY
+        ),
         classification_model=classification_trainer.model,
         warmup_steps=args.warmup_steps,
         ckpt_steps=args.ckpt_steps,
         log_dir=args.log_dir,
+        ckpt_dir=args.ckpt_dir,
+        weight_ckpt_dir=args.weight_ckpt_dir,
     )
-    trainer.train(1, args.ckpt_dir, args.weight_ckpt_dir, False)
+    trainer.train(1, False)

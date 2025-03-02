@@ -285,7 +285,6 @@ def load_dataset(
     data_subset: Optional[DataSubset] = DataSubset.ALL,
     random_state: int | np.random.Generator = 1234,
 ):
-    num_samples = 200
     behaviors = pd.read_parquet(
         data_dir / "processed" / news_dataset.value / "behaviors.parquet",
         columns=["ImpressionID", "History", "Impressions"],
