@@ -132,7 +132,15 @@ def get_weighted_model_eval(
     if not model:
         model = get_weighted_sum_model(model_path)
     with torch.no_grad():
-        res = model(cos_sim, baseline)
+        res = (
+            model(
+                torch.tensor(cos_sim, device=DEVICE),
+                torch.tensor(baseline, device=DEVICE),
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
     return res
 
 

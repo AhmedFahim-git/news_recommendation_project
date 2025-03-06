@@ -1,7 +1,10 @@
 import argparse
 from news_rec_utils.config import NewsDataset, DataSubset, MODEL_PATH
 from news_rec_utils.trainer import ClassificationModelTrainer, TextModelTrainer
+from news_rec_utils.modelling import get_classification_head
+from news_rec_utils.data_classes import NewsData
 from pathlib import Path
+import numpy as np
 
 
 if __name__ == "__main__":
@@ -32,7 +35,6 @@ if __name__ == "__main__":
         help="Select the number of use to eval",
     )
 
-    # Optional arguments
     parser.add_argument(
         "--model_path",
         type=str,
@@ -56,6 +58,12 @@ if __name__ == "__main__":
         type=Path,
         default=None,
         help="Select the directory for saving model checkpoints",
+    )
+    parser.add_argument(
+        "--classification_model_path",
+        type=Path,
+        default=None,
+        help="Select the Classification Model",
     )
     parser.add_argument(
         "--log_dir",
@@ -86,22 +94,40 @@ if __name__ == "__main__":
     train_news_dataset = NewsDataset[args.train_news_dataset]
     val_news_dataset = NewsDataset[args.val_news_dataset]
 
-    classification_trainer = ClassificationModelTrainer(
-        model_path=args.model_path,
-        data_dir=args.data_dir,
-        train_dataset=train_news_dataset,
-        val_dataset=val_news_dataset,
-        ckpt_dir=args.classification_ckpt_dir,
-        log_dir=args.log_dir,
-    )
-    classification_trainer.train(20)
+    rng = np.random.default_rng(1234)
+
+    train_news_data = None
+    val_news_data = None
+
+    if args.classification_model_path and args.classification_model_path.is_file():
+        classification_model = get_classification_head(args.classification_model_path)
+    else:
+        classification_trainer = ClassificationModelTrainer(
+            model_path=args.model_path,
+            data_dir=args.data_dir,
+            train_dataset=train_news_dataset,
+            val_dataset=val_news_dataset,
+            ckpt_dir=args.classification_ckpt_dir,
+            log_dir=args.log_dir,
+        )
+        classification_trainer.train(5)
+
+        classification_model = classification_trainer.model
+        train_news_data = classification_trainer.train_news_data.get_subset(
+            data_subset=DataSubset.WITH_HISTORY
+        )
+        val_news_data = classification_trainer.val_news_data.get_subset(
+            args.num_val, data_subset=DataSubset.WITH_HISTORY, rng=rng
+        )
 
     trainer = TextModelTrainer(
         model_path=args.model_path,
-        train_news_data=classification_trainer.train_news_data,
-        val_news_data=classification_trainer.val_news_data.get_subset(
-            args.num_val, data_subset=DataSubset.WITH_HISTORY
-        ),
+        data_dir=args.data_dir,
+        train_news_dataset=train_news_dataset,
+        val_news_dataset=val_news_dataset,
+        num_val=args.num_val,
+        train_news_data=train_news_data,
+        val_news_data=val_news_data,
         classification_model=classification_trainer.model,
         warmup_steps=args.warmup_steps,
         ckpt_steps=args.ckpt_steps,

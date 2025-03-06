@@ -81,7 +81,7 @@ class ClassificationModelTrainer:
             in_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, out_dim=1
         ).to(device=DEVICE)
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6)
         self.loss_fn = torch.nn.MarginRankingLoss(2)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, patience=2
@@ -155,22 +155,22 @@ class ClassificationModelTrainer:
         if self.ckpt_dir:
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
             torch.save(self.model.state_dict(), self.ckpt_dir / f"Epoch_{epoch+1}.pt")
-            pd.DataFrame(
-                {
-                    "NewsID": self.train_news_data.news_list[
-                        self.train_news_data.news_rev_index
-                    ],
-                    "Preds": self.train_news_data.expand_baseline_scores(),
-                }
-            ).to_csv(self.ckpt_dir / f"Epoch_{epoch+1}_train.csv", index=False)
-            pd.DataFrame(
-                {
-                    "NewsID": self.val_news_data.news_list[
-                        self.val_news_data.news_rev_index
-                    ],
-                    "Preds": self.val_news_data.expand_baseline_scores(),
-                }
-            ).to_csv(self.ckpt_dir / f"Epoch_{epoch+1}_val.csv", index=False)
+            # pd.DataFrame(
+            # {
+            # "NewsID": self.train_news_data.news_list[
+            # self.train_news_data.news_rev_index
+            # ],
+            # "Preds": self.train_news_data.expand_baseline_scores(),
+            # }
+            # ).to_csv(self.ckpt_dir / f"Epoch_{epoch+1}_train.csv", index=False)
+            # pd.DataFrame(
+            # {
+            # "NewsID": self.val_news_data.news_list[
+            # self.val_news_data.news_rev_index
+            # ],
+            # "Preds": self.val_news_data.expand_baseline_scores(),
+            # }
+            # ).to_csv(self.ckpt_dir / f"Epoch_{epoch+1}_val.csv", index=False)
 
     def train(self, num_epochs: int):
         for i in range(num_epochs):
